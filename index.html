@@ -5,7 +5,10 @@
     <meta http-equiv="X-UA-Compatible" content="IE=edge" />
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
     <title>Vejledningsplanlægger</title>
+    
+    <!-- Sikrer kompatibilitet i Safari og Firefox -->
     <script src="https://cdn.jsdelivr.net/gh/gzuidhof/coi-serviceworker@latest/coi-serviceworker.min.js"></script>
+    
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.css" />
   </head>
   <body>
@@ -24,21 +27,40 @@ import re
 
 st.set_page_config(page_title="Vejledningsplanlægger", layout="wide")
 
+# CSS: Sikrer pæn sidebar uden mærkelige linjeskift
 st.markdown("""
 <style>
     [data-testid="stSidebar"] { min-width: 400px !important; }
-    label[data-testid="stWidgetLabel"] p { white-space: nowrap !important; display: inline-block !important; }
+    label[data-testid="stWidgetLabel"] p {
+        white-space: nowrap !important;
+        display: inline-block !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("📅 Vejledningsplanlægger")
-st.info("Version 18. januar 2026")
+st.info("Denne app kører 100% lokalt i din browser (GDPR-sikker).")
 
-# --- SIDEBAR ---
+# --- SIDEBAR: INDSTILLINGER ---
 st.sidebar.header("Indstillinger")
-start_tid_str = st.sidebar.text_input("Starttidspunkt (tt.mm)", value="08:00")
-varighed = st.sidebar.number_input("Minutter pr. vejledning", value=15)
-pause_input = st.sidebar.text_area("Pauser", value="09:50-10:10, 11:45-12:15, 13:50-14:00")
+
+start_tid_str = st.sidebar.text_input(
+    "Starttidspunkt (tt.mm)", 
+    value="08:00",
+    help="Indtast hvornår første vejledning starter (f.eks. 08:00)."
+)
+
+varighed = st.sidebar.number_input(
+    "Minutter pr. vejledning", 
+    value=15,
+    help="Standard er 15 minutter."
+)
+
+pause_input = st.sidebar.text_area(
+    "Pauser", 
+    value="09:50-10:10, 11:45-12:15, 13:50-14:00",
+    help="Format: start-slut. Adskil flere pauser med komma."
+)
 
 def parse_pauser(pause_str):
     pauser = []
@@ -54,18 +76,18 @@ def parse_pauser(pause_str):
 def is_overlapping(s1, e1, s2, e2):
     return s1 < e2 and e1 > s2
 
-def solve_final_stationary(df, start_str, pauses):
+def solve_final_logic(df, start_str, pauses):
     try:
         start_str = start_str.replace(".", ":")
         global_start = datetime.strptime(start_str, "%H:%M")
     except: return None
 
-    # 1. BEREGN BELASTNING OG RANGERING
+    # 1. Belastning og rangering
     t_counts = pd.concat([df['Lærer1'], df['Lærer2']]).astype(str).str.strip().value_counts().to_dict()
     all_teachers = sorted(t_counts.keys(), key=lambda x: (t_counts[x], x), reverse=True)
     teacher_rank = {teacher: i for i, teacher in enumerate(all_teachers)}
 
-    # 2. PLANLÆG TIDER (Kompakt / Gap-filling)
+    # 2. Planlæg tider (Maksimal kompakthed)
     df['priority'] = df.apply(lambda r: t_counts.get(str(r['Lærer1']).strip(), 0) + t_counts.get(str(r['Lærer2']).strip(), 0), axis=1)
     df_sorted = df.sort_values(by='priority', ascending=False)
     
@@ -94,11 +116,9 @@ def solve_final_stationary(df, start_str, pauses):
             teacher_busy_slots[l].sort()
         planned_sessions.append({**row.to_dict(), 's_dt': curr, 'e_dt': endt})
 
-    # 3. TILDEL BORDE (Permanent parkeringsplads-model)
+    # 3. Tildel borde (Minimerer flyt for travle lærere)
     sessions = sorted(planned_sessions, key=lambda x: x['s_dt'])
     
-    # Find ud af hvor mange borde der er i brug samtidig (max parallelle møder)
-    # Dette fortæller os hvor mange lærere der kan få en 'fast plads'
     time_points = []
     for s in sessions:
         time_points.append((s['s_dt'], 1))
@@ -110,33 +130,25 @@ def solve_final_stationary(df, start_str, pauses):
         current += delta
         max_concurrent = max(max_concurrent, current)
 
-    # De top 'max_concurrent' lærere får et permanent bord
+    # De mest travle lærere får faste borde
     permanent_teachers = all_teachers[:max_concurrent]
     teacher_fixed_table = {t: i+1 for i, t in enumerate(permanent_teachers)}
     
-    table_occupied_until = {} # For de lærere der IKKE har fast bord
+    table_occupied_until = {} 
     final_results = []
     
     for s in sessions:
         l1, l2 = str(s['Lærer1']).strip(), str(s['Lærer2']).strip()
         start, end = s['s_dt'], s['e_dt']
-        
-        # Udnævn VÆRT (den med bedst rangering / flest elever)
         host = l1 if teacher_rank[l1] < teacher_rank[l2] else l2
         guest = l2 if host == l1 else l1
-        
         assigned_table = None
         
-        # PRIORITET 1: Hvis Værten har et fast bord, så brug det altid
         if host in teacher_fixed_table:
             assigned_table = teacher_fixed_table[host]
-        
-        # PRIORITET 2: Hvis Værten ikke har et fast bord, men Gæsten har, så brug Gæstens bord
         elif guest in teacher_fixed_table:
             assigned_table = teacher_fixed_table[guest]
-            
-        # PRIORITET 3: Ingen af dem har et fast bord -> find det første ledige 'gæstebord'
-        # Vi starter efter de faste borde for at undgå rod
+        
         if assigned_table is None:
             t_nr = max_concurrent + 1
             while True:
@@ -157,18 +169,22 @@ def solve_final_stationary(df, start_str, pauses):
     res_df = pd.DataFrame(final_results)
     return res_df.drop(columns=['priority', 's_dt', 'e_dt']).sort_values(by=['Starttid', 'bord_nr'])
 
-# --- UI ---
+# --- FORSIDE ---
 st.markdown("---")
-uploaded_file = st.file_uploader("Upload Excel", type=["xlsx"])
+st.subheader("Instruktion")
+st.write("Upload et Excel-ark med følgende kolonner i første række:")
+st.code("K.id., Fornavn, Efternavn, Fag1, Lærer1, Fag2, Lærer2")
+
+uploaded_file = st.file_uploader("Vælg Excel-fil", type=["xlsx"])
 
 if uploaded_file:
     try:
         input_df = pd.read_excel(uploaded_file)
         pauser = parse_pauser(pause_input)
-        result = solve_final_stationary(input_df, start_tid_str, pauser)
+        result = solve_final_logic(input_df, start_tid_str, pauser)
         
         if result is not None:
-            st.success(f"✅ Plan færdig! Sidste slut: {result['Sluttid'].max()}")
+            st.success(f"✅ Planlægning færdig! Sidste vejledning slutter kl. {result['Sluttid'].max()}")
             
             def get_excel(data, mode):
                 output = io.BytesIO()
@@ -188,12 +204,13 @@ if uploaded_file:
                             data[data['bord_nr']==b].to_excel(writer, sheet_name=f"Bord {b}", index=False)
                 return output.getvalue()
 
+            st.markdown("### Download resultater")
             c1, c2, c3 = st.columns(3)
-            c1.download_button("📂 Lærer-planer", get_excel(result, 'laerer'), "laerer_planer.xlsx")
-            c2.download_button("🎓 Elev-planer", get_excel(result, 'elev'), "elev_planer.xlsx")
-            c3.download_button("🖼️ Bord-planer", get_excel(result, 'bord'), "bord_planer.xlsx")
+            c1.download_button("📂 Hent Lærer-planer", get_excel(result, 'laerer'), "laerer_planer.xlsx")
+            c2.download_button("🎓 Hent Elev-planer", get_excel(result, 'elev'), "elev_planer.xlsx")
+            c3.download_button("🖼️ Hent Bord-planer", get_excel(result, 'bord'), "bord_planer.xlsx")
     except Exception as e:
-        st.error(f"Fejl: {e}")
+        st.error(f"Der skete en fejl: {e}")
 `
         },
       });
