@@ -24,25 +24,40 @@ import re
 
 st.set_page_config(page_title="Vejledningsplanlægger", layout="wide")
 
+# CSS der tvinger sidebaren bred og fjerner linjeskift
 st.markdown("""
 <style>
-    [data-testid="stSidebar"] { min-width: 380px !important; }
+    [data-testid="stSidebar"] { min-width: 400px !important; }
     label[data-testid="stWidgetLabel"] p {
         white-space: nowrap !important;
         display: inline-block !important;
-        margin-right: 5px !important;
     }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("📅 Vejledningsplanlægger")
-st.info("Optimeret logik: Minimale antal borde, men 0 bordskift for de travleste lærere.")
+st.info("Stationær-logik v3: De travleste lærere er 'Værter' og bliver ved deres faste bord hele dagen.")
 
 # --- SIDEBAR ---
 st.sidebar.header("Indstillinger")
-start_tid_str = st.sidebar.text_input("Starttidspunkt (tt.mm)", value="08:00", help="Brug formatet 08:00 eller 08.00")
-varighed = st.sidebar.number_input("Minutter pr. vejledning", value=15, help="Standard er 15 min.")
-pause_input = st.sidebar.text_area("Pauser", value="09:50-10:10, 11:45-12:15, 13:50-14:00", help="Format: start-slut, adskilt af komma.")
+
+start_tid_str = st.sidebar.text_input(
+    "Starttidspunkt (tt.mm)", 
+    value="08:00", 
+    help="Indtast hvornår første vejledning starter (f.eks. 08:00)."
+)
+
+varighed = st.sidebar.number_input(
+    "Minutter pr. vejledning", 
+    value=15, 
+    help="Standard er 15 minutter."
+)
+
+pause_input = st.sidebar.text_area(
+    "Pauser", 
+    value="09:50-10:10, 11:45-12:15, 13:50-14:00",
+    help="Format: start-slut, adskilt af komma."
+)
 
 def parse_pauser(pause_str):
     pauser = []
@@ -58,19 +73,25 @@ def parse_pauser(pause_str):
 def is_overlapping(s1, e1, s2, e2):
     return s1 < e2 and e1 > s2
 
-def solve_scheduling_smart_tables(df, start_str, pauses):
+def solve_scheduling_absolute_stationary(df, start_str, pauses):
     try:
         start_str = start_str.replace(".", ":")
         global_start = datetime.strptime(start_str, "%H:%M")
     except: return None
 
-    # 1. Beregn lærer-belastning (vigtigt for at udpege 'Værten')
-    t_counts = pd.concat([df['Lærer1'], df['Lærer2']]).value_counts().to_dict()
-    df['priority'] = df.apply(lambda r: t_counts.get(r['Lærer1'], 0) + t_counts.get(r['Lærer2'], 0), axis=1)
+    # 1. BEREGN BELASTNING OG RANGERING
+    # Vi tæller hvor mange elever hver lærer har i alt
+    t_counts = pd.concat([df['Lærer1'], df['Lærer2']]).astype(str).str.strip().value_counts().to_dict()
     
-    # Planlæg tider først (kompakt rækkefølge)
+    # Ranger lærere efter travlhed (initialer som tie-breaker for konsistens)
+    all_teachers = sorted(t_counts.keys(), key=lambda x: (t_counts[x], x), reverse=True)
+    teacher_rank = {teacher: i for i, teacher in enumerate(all_teachers)}
+
+    # 2. PLANLÆG TIDER (Kompakt rækkefølge, prioriter de mest travle lærere først)
+    df['priority'] = df.apply(lambda r: t_counts.get(str(r['Lærer1']).strip(), 0) + t_counts.get(str(r['Lærer2']).strip(), 0), axis=1)
     df_sorted = df.sort_values(by='priority', ascending=False)
-    teacher_busy = {}
+    
+    teacher_busy_slots = {}
     planned_sessions = []
 
     for _, row in df_sorted.iterrows():
@@ -79,87 +100,85 @@ def solve_scheduling_smart_tables(df, start_str, pauses):
         found = False
         while not found:
             endt = curr + timedelta(minutes=varighed)
+            # Tjek pauser
             if any(is_overlapping(curr, endt, ps, pe) for ps, pe in pauses):
                 curr = next(pe for ps, pe in pauses if is_overlapping(curr, endt, ps, pe))
                 continue
+            # Tjek lærere
             conflict = False
             for l in set([l1, l2]):
-                if any(is_overlapping(curr, endt, bs, be) for bs, be in teacher_busy.get(l, [])):
-                    curr = next(be for bs, be in teacher_busy.get(l, []) if is_overlapping(curr, endt, bs, be))
+                if any(is_overlapping(curr, endt, bs, be) for bs, be in teacher_busy_slots.get(l, [])):
+                    curr = next(be for bs, be in teacher_busy_slots.get(l, []) if is_overlapping(curr, endt, bs, be))
                     conflict = True; break
             if not conflict: found = True
         
         for l in set([l1, l2]):
-            if l not in teacher_busy: teacher_busy[l] = []
-            teacher_busy[l].append((curr, endt))
-            teacher_busy[l].sort()
+            if l not in teacher_busy_slots: teacher_busy_slots[l] = []
+            teacher_busy_slots[l].append((curr, endt))
+            teacher_busy_slots[l].sort()
         
-        res = row.to_dict()
-        res.update({'start_dt': curr, 'end_dt': endt})
-        planned_sessions.append(res)
+        planned_sessions.append({**row.to_dict(), 'start_dt': curr, 'end_dt': endt})
 
-    # Sorter kronologisk til bord-tildeling
-    sessions_df = pd.DataFrame(planned_sessions).sort_values(by='start_dt')
+    # 3. TILDEL BORDE (Hjemmebase-model)
+    # Sorter alle sessioner kronologisk
+    sessions = sorted(planned_sessions, key=lambda x: x['start_dt'])
+    
+    # Vi tildeler hver lærer et 'BaseBord' i rangorden
+    # Men vi tjekker om vi kan genbruge lavere bordnumre for at holde det nede
+    teacher_base_table = {}
+    table_usage_history = {} # {bord_nr: [(start, slut)]}
 
-    # 2. Dynamisk bord-tildeling med præference for kontinuitet
-    table_free_at = {}        # {bord_nr: datetime}
-    teacher_last_table = {}   # {lærer: bord_nr}
-    final_output = []
-
-    for _, sess in sessions_df.iterrows():
-        l1, l2 = str(sess['Lærer1']).strip(), str(sess['Lærer2']).strip()
-        s_dt, e_dt = sess['start_dt'], sess['end_dt']
+    final_results = []
+    for s in sessions:
+        l1, l2 = str(s['Lærer1']).strip(), str(s['Lærer2']).strip()
+        s_dt, e_dt = s['start_dt'], s['end_dt']
         
-        # Udpeg Værten (den mest travle lærer)
-        host = l1 if t_counts.get(l1, 0) >= t_counts.get(l2, 0) else l2
-        guest = l2 if host == l1 else l1
+        # Udnævn VÆRT (den med flest elever / bedst rangering)
+        host = l1 if teacher_rank[l1] < teacher_rank[l2] else l2
         
-        assigned_table = None
-        
-        # Strategi A: Kan værten blive ved sit forrige bord?
-        if host in teacher_last_table:
-            prev_tab = teacher_last_table[host]
-            if table_free_at.get(prev_tab, global_start) <= s_dt:
-                assigned_table = prev_tab
-
-        # Strategi B: Hvis ikke, kan gæsten blive ved sit forrige bord?
-        if not assigned_table and guest in teacher_last_table:
-            prev_tab = teacher_last_table[guest]
-            if table_free_at.get(prev_tab, global_start) <= s_dt:
-                assigned_table = prev_tab
-
-        # Strategi C: Find det første ledige bord (genbrug lave numre først)
-        if not assigned_table:
-            t_nr = 1
+        # Hvis Værten ikke har et bord endnu, så tildel det lavest mulige bord, 
+        # der er ledigt i ALLE Værtens planlagte arbejdstider
+        if host not in teacher_base_table:
+            target_table = 1
             while True:
-                if table_free_at.get(t_nr, global_start) <= s_dt:
-                    assigned_table = t_nr
+                # Tjek om dette bordnummer er ledigt i alle tidsrum hvor host er vært
+                collision = False
+                host_all_slots = teacher_busy_slots[host]
+                for h_s, h_e in host_all_slots:
+                    if any(is_overlapping(h_s, h_e, us, ue) for us, ue in table_usage_history.get(target_table, [])):
+                        collision = True; break
+                
+                if not collision:
+                    teacher_base_table[host] = target_table
                     break
-                t_nr += 1
+                target_table += 1
         
-        # Opdater registre
-        table_free_at[assigned_table] = e_dt
-        teacher_last_table[host] = assigned_table
-        teacher_last_table[guest] = assigned_table # Gæsten husker også dette bord til næste gang
+        assigned_table = teacher_base_table[host]
         
-        sess['Bord'] = f"Bord {assigned_table}"
-        sess['Starttid'] = s_dt.strftime("%H:%M")
-        sess['Sluttid'] = e_dt.strftime("%H:%M")
-        final_output.append(sess)
+        # Registrer at bordet er optaget i dette tidsrum
+        if assigned_table not in table_usage_history: table_usage_history[assigned_table] = []
+        table_usage_history[assigned_table].append((s_dt, e_dt))
+        
+        s.update({
+            'Starttid': s_dt.strftime("%H:%M"),
+            'Sluttid': e_dt.strftime("%H:%M"),
+            'Bord': f"Bord {assigned_table}"
+        })
+        final_results.append(s)
 
-    res_df = pd.DataFrame(final_output)
+    res_df = pd.DataFrame(final_results)
     return res_df.drop(columns=['priority', 'start_dt', 'end_dt']).sort_values(by=['Starttid', 'Bord'])
 
 # --- UI ---
 st.markdown("---")
-st.write("**Overskrifter:** K.id., Fornavn, Efternavn, Fag1, Lærer1, Fag2, Lærer2")
+st.write("**Regneark-overskrifter:** K.id., Fornavn, Efternavn, Fag1, Lærer1, Fag2, Lærer2")
 uploaded_file = st.file_uploader("", type=["xlsx"])
 
 if uploaded_file:
     try:
         input_df = pd.read_excel(uploaded_file)
         pauser = parse_pauser(pause_input)
-        result = solve_scheduling_smart_tables(input_df, start_tid_str, pauser)
+        result = solve_scheduling_absolute_stationary(input_df, start_tid_str, pauser)
         
         if result is not None:
             st.success(f"✅ Plan færdig! Sidste slut: {result['Sluttid'].max()}")
