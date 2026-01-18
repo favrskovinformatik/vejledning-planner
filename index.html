@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
     <title>Vejledningsplanlægger</title>
     
-    <!-- Dette script løser problemet i Safari og Firefox på GitHub Pages -->
+    <!-- Løser problemer i Safari og Firefox på GitHub Pages -->
     <script src="https://cdn.jsdelivr.net/gh/gzuidhof/coi-serviceworker@latest/coi-serviceworker.min.js"></script>
     
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.css" />
@@ -55,7 +55,6 @@ def solve_scheduling_optimized(df, start_str, pauses):
         global_start = datetime.strptime(start_str, "%H:%M")
     except: return None
 
-    # Intern prioritering
     teacher_counts = pd.concat([df['Lærer1'], df['Lærer2']]).value_counts().to_dict()
     df['priority'] = df.apply(lambda r: teacher_counts.get(r['Lærer1'], 0) + teacher_counts.get(r['Lærer2'], 0), axis=1)
     df = df.sort_values(by='priority', ascending=False)
@@ -70,7 +69,6 @@ def solve_scheduling_optimized(df, start_str, pauses):
         
         while not found_slot:
             attempt_end = current_attempt + timedelta(minutes=varighed)
-            
             overlap_pause = False
             for p_s, p_e in pauses:
                 if is_overlapping(current_attempt, attempt_end, p_s, p_e):
@@ -90,8 +88,7 @@ def solve_scheduling_optimized(df, start_str, pauses):
             
             if not conflict:
                 found_slot = True
-            else:
-                continue
+            else: continue
         
         for l in set([l1, l2]):
             if l not in teacher_busy: teacher_busy[l] = []
@@ -125,9 +122,9 @@ if uploaded_file:
         result = solve_scheduling_optimized(input_df, start_tid_str, pauser)
         
         if result is not None:
-            st.success(f"Plan færdig! Sidste slut: {result['Sluttid'].max()}")
-            st.dataframe(result, use_container_width=True)
-
+            # Viser kun en succes-besked i stedet for hele tabellen
+            st.success(f"✅ Planlægning færdig! Sidste vejledning slutter kl. {result['Sluttid'].max()}")
+            
             def get_excel(data, mode):
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -144,7 +141,7 @@ if uploaded_file:
                             d_temp[d_temp['Kl']==k].drop(columns=['Kl']).to_excel(writer, sheet_name=f"Klasse {k}", index=False)
                 return output.getvalue()
 
-            st.markdown("### Download")
+            st.markdown("### Download resultater")
             c1, c2 = st.columns(2)
             c1.download_button("📂 Hent Lærer-planer", get_excel(result, 'laerer'), "laerer_planer.xlsx")
             c2.download_button("🎓 Hent Elev-planer", get_excel(result, 'elev'), "elev_planer.xlsx")
