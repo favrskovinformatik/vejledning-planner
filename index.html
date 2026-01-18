@@ -26,17 +26,16 @@ import re
 
 st.set_page_config(page_title="Vejledningsplanlægger", layout="wide")
 
-# CSS der tvinger sidebaren til at være bredere og forbyder ALLE linjeskift i tekster
+# CSS der sikrer plads til spørgsmålstegn og forhindrer linjeskift
 st.markdown("""
 <style>
     [data-testid="stSidebar"] {
-        min-width: 350px !important;
+        min-width: 380px !important;
     }
-    /* Tvinger labels til at blive på én linje og fylde det hele */
     label[data-testid="stWidgetLabel"] p {
         white-space: nowrap !important;
-        display: block !important;
-        width: 500px !important;
+        display: inline-block !important;
+        margin-right: 5px !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -47,19 +46,29 @@ st.info("Denne app kører 100% lokalt i din browser (GDPR-sikker).")
 # --- SIDEBAR ---
 st.sidebar.header("Indstillinger")
 
-# Vi bruger punktum i stedet for kolon i titlen for at undgå 'smiley-logik' eller formateringsfejl
-start_tid_str = st.sidebar.text_input("Starttidspunkt (tt.mm)", value="08:00")
+# 1. Starttidspunkt med hjælpetekst
+start_tid_str = st.sidebar.text_input(
+    "Starttidspunkt (tt.mm)", 
+    value="08:00",
+    help="Indtast hvornår den første vejledning skal starte. Du kan bruge både punktum og kolon (f.eks. 08:00 eller 08.00)."
+)
 
-varighed = st.sidebar.number_input("Minutter pr. vejledning", value=15)
+# 2. Varighed med hjælpetekst
+varighed = st.sidebar.number_input(
+    "Minutter pr. vejledning", 
+    value=15,
+    help="Angiv hvor mange minutter der afsættes til hver elev. Programmet pakker skemaet tættest muligt ud fra dette tal."
+)
 
+# 3. Pauser med hjælpetekst
 pause_input = st.sidebar.text_area(
     "Pauser", 
-    value="09:50-10:10, 11:45-12:15, 13:50-14:00"
+    value="09:50-10:10, 11:45-12:15, 13:50-14:00",
+    help="Indtast tidsrum hvor ingen må have vejledning (f.eks. frikvarter eller frokost). Brug formatet: start-slut. Flere pauser adskilles med komma."
 )
 
 def parse_pauser(pause_str):
     pauser = []
-    # Vi tillader både . og : i input
     matches = re.findall(r"(\\d{1,2}[:.]\\d{2})\\s*-\\s*(\\d{1,2}[:.]\\d{2})", pause_str)
     for m in matches:
         try:
@@ -74,7 +83,6 @@ def is_overlapping(s1, e1, s2, e2):
 
 def solve_scheduling_optimized(df, start_str, pauses):
     try:
-        # Gør start_str sikker uanset om brugeren skriver 08.00 eller 08:00
         start_str = start_str.replace(".", ":")
         global_start = datetime.strptime(start_str, "%H:%M")
     except: return None
@@ -160,7 +168,6 @@ if uploaded_file:
                         alle_l = sorted(list(set(data['Lærer1'].astype(str)) | set(data['Lærer2'].astype(str))))
                         for l in alle_l:
                             l_df = data[(data['Lærer1'] == l) | (data['Lærer2'] == l)]
-                            # Sheet navne må max være 31 tegn
                             l_name = f"Lærer {l}"[:31]
                             l_df.to_excel(writer, sheet_name=l_name, index=False)
                     else:
