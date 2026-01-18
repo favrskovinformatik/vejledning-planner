@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Vejledningsplanlægger</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.css" />
+    <style>
+      body { background-color: #f0f2f6; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.js"></script>
+    <script>
+      stlite.mount({
+        requirements: ["pandas", "openpyxl"],
+        files: {
+          "streamlit_app.py": `
+import streamlit as st
+import pandas as pd
+from datetime import datetime, timedelta
+import io
+import re
+
+st.set_page_config(page_title="Vejledningsplanlægger", layout="wide")
+st.title("📅 Vejledningsplanlægger")
+st.info("Denne app kører 100% lokalt i din browser. Ingen data sendes til en server (GDPR-sikker).")
+
+# --- SIDEBAR: INDSTILLINGER ---
+st.sidebar.header("Indstillinger")
+start_tid_str = st.sidebar.text_input("Starttidspunkt (format: hh:mm)", value="08:00")
+varighed = st.sidebar.number_input("Varighed pr. elev (minutter)", value=15)
+pause_input = st.sidebar.text_area(
+    "Pauser (format: 09:50-10:10, 12:00-12:30)", 
+    value="09:50-10:10, 11:45-12:15, 13:50-14:00"
+)
+
+def parse_pauser(pause_str):
+    pauser = []
+    matches = re.findall(r"(\\d{1,2}:\\d{2})\\s*-\\s*(\\d{1,2}:\\d{2})", pause_str)
+    for m in matches:
+        try:
+            pauser.append((datetime.strptime(m[0], "%H:%M"), datetime.strptime(m[1], "%H:%M")))
+        except: continue
+    return sorted(pauser)
+
+def is_overlapping(s1, e1, s2, e2):
+    return s1 < e2 and e1 > s2
+
+def solve_scheduling_optimized(df, start_str, pauses):
+    try:
+        global_start = datetime.strptime(start_str, "%H:%M")
+    except: return None
+
+    # Intern prioritering for at pakke skemaet tættest muligt
+    teacher_counts = pd.concat([df['Lærer1'], df['Lærer2']]).value_counts().to_dict()
+    df['priority'] = df.apply(lambda r: teacher_counts.get(r['Lærer1'], 0) + teacher_counts.get(r['Lærer2'], 0), axis=1)
+    df = df.sort_values(by='priority', ascending=False)
+
+    teacher_busy = {}
+    results = []
+
+    for _, row in df.iterrows():
+        l1, l2 = str(row['Lærer1']).strip(), str(row['Lærer2']).strip()
+        current_attempt = global_start
+        found_slot = False
+        
+        while not found_slot:
+            attempt_end = current_attempt + timedelta(minutes=varighed)
+            
+            # Tjek pauser
+            overlap_pause = False
+            for p_s, p_e in pauses:
+                if is_overlapping(current_attempt, attempt_end, p_s, p_e):
+                    current_attempt = p_e
+                    overlap_pause = True
+                    break
+            if overlap_pause: continue
+            
+            # Tjek lærere
+            conflict = False
+            for l in set([l1, l2]):
+                for b_s, b_e in teacher_busy.get(l, []):
+                    if is_overlapping(current_attempt, attempt_end, b_s, b_e):
+                        current_attempt = b_e
+                        conflict = True
+                        break
+                if conflict: break
+            
+            if not conflict:
+                found_slot = True
+            else:
+                continue
+        
+        # Book tidsrummet
+        for l in set([l1, l2]):
+            if l not in teacher_busy: teacher_busy[l] = []
+            teacher_busy[l].append((current_attempt, attempt_end))
+            teacher_busy[l].sort()
+            
+        res = row.to_dict()
+        res.update({
+            'Starttid': current_attempt.strftime("%H:%M"), 
+            'Sluttid': attempt_end.strftime("%H:%M")
+        })
+        results.append(res)
+
+    # Lav DataFrame og FJERN priority-kolonnen med det samme
+    res_df = pd.DataFrame(results)
+    if 'priority' in res_df.columns:
+        res_df = res_df.drop(columns=['priority'])
+    
+    # Tildel borde baseret på parallelle møder
+    all_times = sorted(res_df['Starttid'].unique())
+    for t in all_times:
+        simultaneous = res_df[res_df['Starttid'] == t]
+        for i, idx in enumerate(simultaneous.index):
+            res_df.at[idx, 'Bord'] = f"Bord {i+1}"
+            
+    return res_df.sort_values(by=['Starttid', 'Bord'])
+
+# --- HOVEDVINDUE ---
+st.markdown("---")
+st.subheader("Upload din plan")
+st.write("**Regnearket skal have præcis disse overskrifter i første række:**")
+st.code("K.id., Fornavn, Efternavn, Fag1, Lærer1, Fag2, Lærer2")
+
+uploaded_file = st.file_uploader("", type=["xlsx"])
+
+if uploaded_file:
+    try:
+        input_df = pd.read_excel(uploaded_file)
+        pauser = parse_pauser(pause_input)
+        result = solve_scheduling_optimized(input_df, start_tid_str, pauser)
+        
+        if result is not None:
+            st.success(f"Planlægning fuldført! Sidste vejledning slutter kl. {result['Sluttid'].max()}")
+            st.dataframe(result, use_container_width=True)
+
+            # Excel-generering
+            def get_excel(data, mode):
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    if mode == 'laerer':
+                        data.to_excel(writer, sheet_name='Samlet Plan', index=False)
+                        alle_laerere = sorted(list(set(data['Lærer1'].astype(str)) | set(data['Lærer2'].astype(str))))
+                        for l in alle_laerere:
+                            l_df = data[(data['Lærer1'] == l) | (data['Lærer2'] == l)]
+                            l_df.to_excel(writer, sheet_name=f"Lærer {l[:25]}", index=False)
+                    else:
+                        # Sorter efter navn til hovedarket
+                        data.sort_values(by=['Fornavn', 'Efternavn']).to_excel(writer, sheet_name='Alle elever (Navn)', index=False)
+                        # Opret klasse-ark (Kl er en midlertidig kolonne her)
+                        data_temp = data.copy()
+                        data_temp['Kl'] = data_temp['K.id.'].astype(str).str[:2]
+                        for klasse in sorted(data_temp['Kl'].unique()):
+                            k_df = data_temp[data_temp['Kl'] == klasse].drop(columns=['Kl'])
+                            k_df.to_excel(writer, sheet_name=f"Klasse {klasse}", index=False)
+                return output.getvalue()
+
+            st.markdown("### Download resultater")
+            col1, col2 = st.columns(2)
+            col1.download_button("📂 Hent Lærer-planer", get_excel(result, 'laerer'), "laerer_planer.xlsx")
+            col2.download_button("🎓 Hent Elev-planer", get_excel(result, 'elev'), "elev_planer.xlsx")
+    except Exception as e:
+        st.error(f"Fejl ved behandling af filen: {e}")
+`
+        },
+      });
+    </script>
+  </body>
+</html>
