@@ -36,13 +36,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📅 Vejledningsplanlægger")
-st.info("Denne version låser de mest travle lærere til faste borde for at minimere bordskift.")
+st.info("Optimeret logik: Minimale antal borde, men 0 bordskift for de travleste lærere.")
 
 # --- SIDEBAR ---
 st.sidebar.header("Indstillinger")
-start_tid_str = st.sidebar.text_input("Starttidspunkt (tt.mm)", value="08:00")
-varighed = st.sidebar.number_input("Minutter pr. vejledning", value=15)
-pause_input = st.sidebar.text_area("Pauser", value="09:50-10:10, 11:45-12:15, 13:50-14:00")
+start_tid_str = st.sidebar.text_input("Starttidspunkt (tt.mm)", value="08:00", help="Brug formatet 08:00 eller 08.00")
+varighed = st.sidebar.number_input("Minutter pr. vejledning", value=15, help="Standard er 15 min.")
+pause_input = st.sidebar.text_area("Pauser", value="09:50-10:10, 11:45-12:15, 13:50-14:00", help="Format: start-slut, adskilt af komma.")
 
 def parse_pauser(pause_str):
     pauser = []
@@ -58,22 +58,22 @@ def parse_pauser(pause_str):
 def is_overlapping(s1, e1, s2, e2):
     return s1 < e2 and e1 > s2
 
-def solve_scheduling_final(df, start_str, pauses):
+def solve_scheduling_smart_tables(df, start_str, pauses):
     try:
         start_str = start_str.replace(".", ":")
         global_start = datetime.strptime(start_str, "%H:%M")
     except: return None
 
-    # 1. Tæl belastning pr. lærer
+    # 1. Beregn lærer-belastning (vigtigt for at udpege 'Værten')
     t_counts = pd.concat([df['Lærer1'], df['Lærer2']]).value_counts().to_dict()
     df['priority'] = df.apply(lambda r: t_counts.get(r['Lærer1'], 0) + t_counts.get(r['Lærer2'], 0), axis=1)
-    df = df.sort_values(by='priority', ascending=False)
-
+    
+    # Planlæg tider først (kompakt rækkefølge)
+    df_sorted = df.sort_values(by='priority', ascending=False)
     teacher_busy = {}
     planned_sessions = []
 
-    # 2. Planlæg tidspunkter (Compact/Gap-filling)
-    for _, row in df.iterrows():
+    for _, row in df_sorted.iterrows():
         l1, l2 = str(row['Lærer1']).strip(), str(row['Lærer2']).strip()
         curr = global_start
         found = False
@@ -98,53 +98,50 @@ def solve_scheduling_final(df, start_str, pauses):
         res.update({'start_dt': curr, 'end_dt': endt})
         planned_sessions.append(res)
 
-    # Sorter efter tid til bord-tildeling
-    sessions_df = pd.DataFrame(planned_sessions).sort_values(by=['start_dt', 'priority'], ascending=[True, False])
+    # Sorter kronologisk til bord-tildeling
+    sessions_df = pd.DataFrame(planned_sessions).sort_values(by='start_dt')
 
-    # 3. Bordtildeling med Anchor-logik
-    table_occupied_until = {} # {bord_nr: datetime}
-    teacher_fixed_table = {}  # {lærer: bord_nr}
-    
+    # 2. Dynamisk bord-tildeling med præference for kontinuitet
+    table_free_at = {}        # {bord_nr: datetime}
+    teacher_last_table = {}   # {lærer: bord_nr}
     final_output = []
-    
+
     for _, sess in sessions_df.iterrows():
         l1, l2 = str(sess['Lærer1']).strip(), str(sess['Lærer2']).strip()
         s_dt, e_dt = sess['start_dt'], sess['end_dt']
         
-        # Hvem er mest travl? (Anchor)
-        if t_counts.get(l1, 0) >= t_counts.get(l2, 0):
-            anchor, guest = l1, l2
-        else:
-            anchor, guest = l2, l1
-            
+        # Udpeg Værten (den mest travle lærer)
+        host = l1 if t_counts.get(l1, 0) >= t_counts.get(l2, 0) else l2
+        guest = l2 if host == l1 else l1
+        
         assigned_table = None
         
-        # A) Kan Anchor blive ved sit faste bord?
-        if anchor in teacher_fixed_table:
-            target = teacher_fixed_table[anchor]
-            if table_occupied_until.get(target, global_start) <= s_dt:
-                assigned_table = target
-        
-        # B) Hvis ikke, kan Guest bruge sit faste bord (hvis de har et)?
-        if assigned_table is None and guest in teacher_fixed_table:
-            target = teacher_fixed_table[guest]
-            if table_occupied_until.get(target, global_start) <= s_dt:
-                assigned_table = target
-                
-        # C) Find det første ledige bord (helst et lavt nummer)
-        if assigned_table is None:
+        # Strategi A: Kan værten blive ved sit forrige bord?
+        if host in teacher_last_table:
+            prev_tab = teacher_last_table[host]
+            if table_free_at.get(prev_tab, global_start) <= s_dt:
+                assigned_table = prev_tab
+
+        # Strategi B: Hvis ikke, kan gæsten blive ved sit forrige bord?
+        if not assigned_table and guest in teacher_last_table:
+            prev_tab = teacher_last_table[guest]
+            if table_free_at.get(prev_tab, global_start) <= s_dt:
+                assigned_table = prev_tab
+
+        # Strategi C: Find det første ledige bord (genbrug lave numre først)
+        if not assigned_table:
             t_nr = 1
             while True:
-                if table_occupied_until.get(t_nr, global_start) <= s_dt:
+                if table_free_at.get(t_nr, global_start) <= s_dt:
                     assigned_table = t_nr
                     break
                 t_nr += 1
         
-        # Lås Anchor til dette bord for fremtiden, hvis de ikke har et
-        if anchor not in teacher_fixed_table:
-            teacher_fixed_table[anchor] = assigned_table
-            
-        table_occupied_until[assigned_table] = e_dt
+        # Opdater registre
+        table_free_at[assigned_table] = e_dt
+        teacher_last_table[host] = assigned_table
+        teacher_last_table[guest] = assigned_table # Gæsten husker også dette bord til næste gang
+        
         sess['Bord'] = f"Bord {assigned_table}"
         sess['Starttid'] = s_dt.strftime("%H:%M")
         sess['Sluttid'] = e_dt.strftime("%H:%M")
@@ -162,7 +159,7 @@ if uploaded_file:
     try:
         input_df = pd.read_excel(uploaded_file)
         pauser = parse_pauser(pause_input)
-        result = solve_scheduling_final(input_df, start_tid_str, pauser)
+        result = solve_scheduling_smart_tables(input_df, start_tid_str, pauser)
         
         if result is not None:
             st.success(f"✅ Plan færdig! Sidste slut: {result['Sluttid'].max()}")
