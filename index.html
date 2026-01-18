@@ -6,7 +6,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
     <title>Vejledningsplanlægger</title>
     
-    <!-- Løser problemer i Safari og Firefox på GitHub Pages -->
     <script src="https://cdn.jsdelivr.net/gh/gzuidhof/coi-serviceworker@latest/coi-serviceworker.min.js"></script>
     
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.css" />
@@ -31,8 +30,10 @@ st.info("Denne app kører 100% lokalt i din browser (GDPR-sikker).")
 
 # --- SIDEBAR ---
 st.sidebar.header("Indstillinger")
-start_tid_str = st.sidebar.text_input("Starttidspunkt(hh:mm)", value="08:00")
-varighed = st.sidebar.number_input("Varighed pr. elev (minutter)", value=15)
+
+# RETTELSE: Vi bruger en kortere label og tilføjer formatet som hjælp
+start_tid_str = st.sidebar.text_input("Starttid (tt:mm)", value="08:00", help="Indtast tidspunkt som f.eks. 08:00")
+varighed = st.sidebar.number_input("Minutter pr. elev", value=15)
 pause_input = st.sidebar.text_area(
     "Pauser", 
     value="09:50-10:10, 11:45-12:15, 13:50-14:00"
@@ -52,6 +53,8 @@ def is_overlapping(s1, e1, s2, e2):
 
 def solve_scheduling_optimized(df, start_str, pauses):
     try:
+        # Håndterer både : og . som adskillelse for at være brugervenlig
+        start_str = start_str.replace(".", ":")
         global_start = datetime.strptime(start_str, "%H:%M")
     except: return None
 
@@ -112,7 +115,10 @@ def solve_scheduling_optimized(df, start_str, pauses):
 
 # --- UI ---
 st.markdown("---")
-st.write("**Overskrifter:** K.id., Fornavn, Efternavn, Fag1, Lærer1, Fag2, Lærer2")
+st.subheader("Upload din plan")
+st.write("**Regnearket skal have præcis disse overskrifter i første række:**")
+st.code("K.id., Fornavn, Efternavn, Fag1, Lærer1, Fag2, Lærer2")
+
 uploaded_file = st.file_uploader("", type=["xlsx"])
 
 if uploaded_file:
@@ -122,7 +128,6 @@ if uploaded_file:
         result = solve_scheduling_optimized(input_df, start_tid_str, pauser)
         
         if result is not None:
-            # Viser kun en succes-besked i stedet for hele tabellen
             st.success(f"✅ Planlægning færdig! Sidste vejledning slutter kl. {result['Sluttid'].max()}")
             
             def get_excel(data, mode):
