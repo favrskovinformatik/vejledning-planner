@@ -36,28 +36,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📅 Vejledningsplanlægger")
-st.info("Denne version minimerer bordskift for lærerne (GDPR-sikker).")
+st.info("Denne version låser de mest travle lærere til faste borde for at minimere bordskift.")
 
 # --- SIDEBAR ---
 st.sidebar.header("Indstillinger")
-
-start_tid_str = st.sidebar.text_input(
-    "Starttidspunkt (tt.mm)", 
-    value="08:00",
-    help="Hvornår starter første vejledning? Format f.eks. 08:00 eller 08.00"
-)
-
-varighed = st.sidebar.number_input(
-    "Minutter pr. vejledning", 
-    value=15,
-    help="Standard er 15 minutter."
-)
-
-pause_input = st.sidebar.text_area(
-    "Pauser", 
-    value="09:50-10:10, 11:45-12:15, 13:50-14:00",
-    help="Tidsrum hvor ingen vejleder. Format: start-slut, start-slut."
-)
+start_tid_str = st.sidebar.text_input("Starttidspunkt (tt.mm)", value="08:00")
+varighed = st.sidebar.number_input("Minutter pr. vejledning", value=15)
+pause_input = st.sidebar.text_area("Pauser", value="09:50-10:10, 11:45-12:15, 13:50-14:00")
 
 def parse_pauser(pause_str):
     pauser = []
@@ -73,38 +58,36 @@ def parse_pauser(pause_str):
 def is_overlapping(s1, e1, s2, e2):
     return s1 < e2 and e1 > s2
 
-def solve_scheduling_with_tables(df, start_str, pauses):
+def solve_scheduling_final(df, start_str, pauses):
     try:
         start_str = start_str.replace(".", ":")
         global_start = datetime.strptime(start_str, "%H:%M")
     except: return None
 
-    # Find travle lærere for prioritering
+    # 1. Tæl belastning pr. lærer
     t_counts = pd.concat([df['Lærer1'], df['Lærer2']]).value_counts().to_dict()
     df['priority'] = df.apply(lambda r: t_counts.get(r['Lærer1'], 0) + t_counts.get(r['Lærer2'], 0), axis=1)
     df = df.sort_values(by='priority', ascending=False)
 
-    teacher_busy = {} # {lærer: [(start, slut)]}
-    results = []
+    teacher_busy = {}
+    planned_sessions = []
 
-    # 1. Planlæg tiderne først (samme logik som før)
+    # 2. Planlæg tidspunkter (Compact/Gap-filling)
     for _, row in df.iterrows():
         l1, l2 = str(row['Lærer1']).strip(), str(row['Lærer2']).strip()
         curr = global_start
         found = False
         while not found:
             endt = curr + timedelta(minutes=varighed)
-            p_overlap = any(is_overlapping(curr, endt, ps, pe) for ps, pe in pauses)
-            if p_overlap:
+            if any(is_overlapping(curr, endt, ps, pe) for ps, pe in pauses):
                 curr = next(pe for ps, pe in pauses if is_overlapping(curr, endt, ps, pe))
                 continue
-            
-            t_conflict = False
+            conflict = False
             for l in set([l1, l2]):
                 if any(is_overlapping(curr, endt, bs, be) for bs, be in teacher_busy.get(l, [])):
                     curr = next(be for bs, be in teacher_busy.get(l, []) if is_overlapping(curr, endt, bs, be))
-                    t_conflict = True; break
-            if not t_conflict: found = True
+                    conflict = True; break
+            if not conflict: found = True
         
         for l in set([l1, l2]):
             if l not in teacher_busy: teacher_busy[l] = []
@@ -112,34 +95,43 @@ def solve_scheduling_with_tables(df, start_str, pauses):
             teacher_busy[l].sort()
         
         res = row.to_dict()
-        res.update({'start_dt': curr, 'end_dt': endt, 'Starttid': curr.strftime("%H:%M"), 'Sluttid': endt.strftime("%H:%M")})
-        results.append(res)
+        res.update({'start_dt': curr, 'end_dt': endt})
+        planned_sessions.append(res)
 
-    res_df = pd.DataFrame(results).sort_values(by='start_dt')
+    # Sorter efter tid til bord-tildeling
+    sessions_df = pd.DataFrame(planned_sessions).sort_values(by=['start_dt', 'priority'], ascending=[True, False])
 
-    # 2. Tildel borde med "Stay-put" logik
+    # 3. Bordtildeling med Anchor-logik
     table_occupied_until = {} # {bord_nr: datetime}
-    teacher_home_table = {}   # {lærer_initialer: bord_nr}
+    teacher_fixed_table = {}  # {lærer: bord_nr}
     
-    final_rows = []
-    # Vi går gennem vejledningerne kronologisk
-    for _, row in res_df.iterrows():
-        l1, l2 = str(row['Lærer1']).strip(), str(row['Lærer2']).strip()
-        s_dt, e_dt = row['start_dt'], row['end_dt']
+    final_output = []
+    
+    for _, sess in sessions_df.iterrows():
+        l1, l2 = str(sess['Lærer1']).strip(), str(sess['Lærer2']).strip()
+        s_dt, e_dt = sess['start_dt'], sess['end_dt']
         
+        # Hvem er mest travl? (Anchor)
+        if t_counts.get(l1, 0) >= t_counts.get(l2, 0):
+            anchor, guest = l1, l2
+        else:
+            anchor, guest = l2, l1
+            
         assigned_table = None
         
-        # Prøv at finde et ledigt bord blandt lærernes tidligere borde
-        pref_tables = []
-        if l1 in teacher_home_table: pref_tables.append(teacher_home_table[l1])
-        if l2 in teacher_home_table: pref_tables.append(teacher_home_table[l2])
+        # A) Kan Anchor blive ved sit faste bord?
+        if anchor in teacher_fixed_table:
+            target = teacher_fixed_table[anchor]
+            if table_occupied_until.get(target, global_start) <= s_dt:
+                assigned_table = target
         
-        for t_nr in pref_tables:
-            if table_occupied_until.get(t_nr, global_start) <= s_dt:
-                assigned_table = t_nr
-                break
-        
-        # Hvis ingen af deres faste borde er ledige, tag det første ledige bord
+        # B) Hvis ikke, kan Guest bruge sit faste bord (hvis de har et)?
+        if assigned_table is None and guest in teacher_fixed_table:
+            target = teacher_fixed_table[guest]
+            if table_occupied_until.get(target, global_start) <= s_dt:
+                assigned_table = target
+                
+        # C) Find det første ledige bord (helst et lavt nummer)
         if assigned_table is None:
             t_nr = 1
             while True:
@@ -148,18 +140,18 @@ def solve_scheduling_with_tables(df, start_str, pauses):
                     break
                 t_nr += 1
         
-        # Opdater hvem der "ejer" bordet nu (den mest travle lærer 'vinder' ejerskabet)
-        if t_counts.get(l1, 0) >= t_counts.get(l2, 0):
-            teacher_home_table[l1] = assigned_table
-        else:
-            teacher_home_table[l2] = assigned_table
+        # Lås Anchor til dette bord for fremtiden, hvis de ikke har et
+        if anchor not in teacher_fixed_table:
+            teacher_fixed_table[anchor] = assigned_table
             
         table_occupied_until[assigned_table] = e_dt
-        row['Bord'] = f"Bord {assigned_table}"
-        final_rows.append(row)
+        sess['Bord'] = f"Bord {assigned_table}"
+        sess['Starttid'] = s_dt.strftime("%H:%M")
+        sess['Sluttid'] = e_dt.strftime("%H:%M")
+        final_output.append(sess)
 
-    final_df = pd.DataFrame(final_rows).drop(columns=['priority', 'start_dt', 'end_dt'])
-    return final_df.sort_values(by=['Starttid', 'Bord'])
+    res_df = pd.DataFrame(final_output)
+    return res_df.drop(columns=['priority', 'start_dt', 'end_dt']).sort_values(by=['Starttid', 'Bord'])
 
 # --- UI ---
 st.markdown("---")
@@ -170,10 +162,10 @@ if uploaded_file:
     try:
         input_df = pd.read_excel(uploaded_file)
         pauser = parse_pauser(pause_input)
-        result = solve_scheduling_with_tables(input_df, start_tid_str, pauser)
+        result = solve_scheduling_final(input_df, start_tid_str, pauser)
         
         if result is not None:
-            st.success(f"✅ Færdig! Sidste vejledning slutter kl. {result['Sluttid'].max()}")
+            st.success(f"✅ Plan færdig! Sidste slut: {result['Sluttid'].max()}")
             
             def get_excel(data, mode):
                 output = io.BytesIO()
