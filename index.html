@@ -6,7 +6,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
     <title>Vejledningsplanlægger</title>
     
-    <!-- Løser problemer i Safari og Firefox -->
     <script src="https://cdn.jsdelivr.net/gh/gzuidhof/coi-serviceworker@latest/coi-serviceworker.min.js"></script>
     
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.css" />
@@ -27,15 +26,17 @@ import re
 
 st.set_page_config(page_title="Vejledningsplanlægger", layout="wide")
 
-# CSS HACK: Tvinger sidebaren til at være bredere og forbyder linjeskift i labels
+# CSS der tvinger sidebaren til at være bredere og forbyder ALLE linjeskift i tekster
 st.markdown("""
 <style>
     [data-testid="stSidebar"] {
-        min-width: 350px;
-        max-width: 350px;
+        min-width: 350px !important;
     }
-    .stMarkdown p {
-        white-space: nowrap;
+    /* Tvinger labels til at blive på én linje og fylde det hele */
+    label[data-testid="stWidgetLabel"] p {
+        white-space: nowrap !important;
+        display: block !important;
+        width: 500px !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -46,27 +47,25 @@ st.info("Denne app kører 100% lokalt i din browser (GDPR-sikker).")
 # --- SIDEBAR ---
 st.sidebar.header("Indstillinger")
 
-# Vi skriver titlen som markdown for at undgå Streamlits automatiske formatering af labels
-st.sidebar.markdown("**Starttidspunkt (tt:mm)**")
-start_tid_str = st.sidebar.text_input("Starttid", value="08:00", label_visibility="collapsed")
+# Vi bruger punktum i stedet for kolon i titlen for at undgå 'smiley-logik' eller formateringsfejl
+start_tid_str = st.sidebar.text_input("Starttidspunkt (tt.mm)", value="08:00")
 
-st.sidebar.markdown("**Minutter pr. vejledning**")
-varighed = st.sidebar.number_input("Varighed", value=15, label_visibility="collapsed")
+varighed = st.sidebar.number_input("Minutter pr. vejledning", value=15)
 
-st.sidebar.markdown("**Pauser**")
 pause_input = st.sidebar.text_area(
     "Pauser", 
-    value="09:50-10:10, 11:45-12:15, 13:50-14:00",
-    label_visibility="collapsed"
+    value="09:50-10:10, 11:45-12:15, 13:50-14:00"
 )
 
 def parse_pauser(pause_str):
     pauser = []
-    matches = re.findall(r"(\\d{1,2}:\\d{2})\\s*-\\s*(\\d{1,2}:\\d{2})", pause_str)
+    # Vi tillader både . og : i input
+    matches = re.findall(r"(\\d{1,2}[:.]\\d{2})\\s*-\\s*(\\d{1,2}[:.]\\d{2})", pause_str)
     for m in matches:
         try:
-            pauser.append((datetime.strptime(m[0].replace(".", ":"), "%H:%M"), 
-                           datetime.strptime(m[1].replace(".", ":"), "%H:%M")))
+            p_start = datetime.strptime(m[0].replace(".", ":"), "%H:%M")
+            p_end = datetime.strptime(m[1].replace(".", ":"), "%H:%M")
+            pauser.append((p_start, p_end))
         except: continue
     return sorted(pauser)
 
@@ -75,11 +74,11 @@ def is_overlapping(s1, e1, s2, e2):
 
 def solve_scheduling_optimized(df, start_str, pauses):
     try:
+        # Gør start_str sikker uanset om brugeren skriver 08.00 eller 08:00
         start_str = start_str.replace(".", ":")
         global_start = datetime.strptime(start_str, "%H:%M")
     except: return None
 
-    # Intern prioritering
     teacher_counts = pd.concat([df['Lærer1'], df['Lærer2']]).value_counts().to_dict()
     df['priority'] = df.apply(lambda r: teacher_counts.get(r['Lærer1'], 0) + teacher_counts.get(r['Lærer2'], 0), axis=1)
     df = df.sort_values(by='priority', ascending=False)
@@ -161,9 +160,11 @@ if uploaded_file:
                         alle_l = sorted(list(set(data['Lærer1'].astype(str)) | set(data['Lærer2'].astype(str))))
                         for l in alle_l:
                             l_df = data[(data['Lærer1'] == l) | (data['Lærer2'] == l)]
-                            l_df.to_excel(writer, sheet_name=f"Lærer {l[:25]}", index=False)
+                            # Sheet navne må max være 31 tegn
+                            l_name = f"Lærer {l}"[:31]
+                            l_df.to_excel(writer, sheet_name=l_name, index=False)
                     else:
-                        data.sort_values(['Fornavn', 'Efternavn']).to_excel(writer, sheet_name='Alle elever (Navn)', index=False)
+                        data.sort_values(['Fornavn', 'Efternavn']).to_excel(writer, sheet_name='Navne', index=False)
                         d_temp = data.copy()
                         d_temp['Kl'] = d_temp['K.id.'].astype(str).str[:2]
                         for k in sorted(d_temp['Kl'].unique()):
