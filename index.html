@@ -5,9 +5,7 @@
     <meta http-equiv="X-UA-Compatible" content="IE=edge" />
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
     <title>Vejledningsplanlægger</title>
-    
     <script src="https://cdn.jsdelivr.net/gh/gzuidhof/coi-serviceworker@latest/coi-serviceworker.min.js"></script>
-    
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.css" />
   </head>
   <body>
@@ -26,12 +24,9 @@ import re
 
 st.set_page_config(page_title="Vejledningsplanlægger", layout="wide")
 
-# CSS der sikrer plads til spørgsmålstegn og forhindrer linjeskift
 st.markdown("""
 <style>
-    [data-testid="stSidebar"] {
-        min-width: 380px !important;
-    }
+    [data-testid="stSidebar"] { min-width: 380px !important; }
     label[data-testid="stWidgetLabel"] p {
         white-space: nowrap !important;
         display: inline-block !important;
@@ -41,30 +36,27 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📅 Vejledningsplanlægger")
-st.info("Denne app kører 100% lokalt i din browser (GDPR-sikker).")
+st.info("Denne version minimerer bordskift for lærerne (GDPR-sikker).")
 
 # --- SIDEBAR ---
 st.sidebar.header("Indstillinger")
 
-# 1. Starttidspunkt med hjælpetekst
 start_tid_str = st.sidebar.text_input(
     "Starttidspunkt (tt.mm)", 
     value="08:00",
-    help="Indtast hvornår den første vejledning skal starte. Du kan bruge både punktum og kolon (f.eks. 08:00 eller 08.00)."
+    help="Hvornår starter første vejledning? Format f.eks. 08:00 eller 08.00"
 )
 
-# 2. Varighed med hjælpetekst
 varighed = st.sidebar.number_input(
     "Minutter pr. vejledning", 
     value=15,
-    help="Angiv hvor mange minutter der afsættes til hver elev. Programmet pakker skemaet tættest muligt ud fra dette tal."
+    help="Standard er 15 minutter."
 )
 
-# 3. Pauser med hjælpetekst
 pause_input = st.sidebar.text_area(
     "Pauser", 
     value="09:50-10:10, 11:45-12:15, 13:50-14:00",
-    help="Indtast tidsrum hvor ingen må have vejledning (f.eks. frikvarter eller frokost). Brug formatet: start-slut. Flere pauser adskilles med komma."
+    help="Tidsrum hvor ingen vejleder. Format: start-slut, start-slut."
 )
 
 def parse_pauser(pause_str):
@@ -72,104 +64,124 @@ def parse_pauser(pause_str):
     matches = re.findall(r"(\\d{1,2}[:.]\\d{2})\\s*-\\s*(\\d{1,2}[:.]\\d{2})", pause_str)
     for m in matches:
         try:
-            p_start = datetime.strptime(m[0].replace(".", ":"), "%H:%M")
-            p_end = datetime.strptime(m[1].replace(".", ":"), "%H:%M")
-            pauser.append((p_start, p_end))
+            p_s = datetime.strptime(m[0].replace(".", ":"), "%H:%M")
+            p_e = datetime.strptime(m[1].replace(".", ":"), "%H:%M")
+            pauser.append((p_s, p_e))
         except: continue
     return sorted(pauser)
 
 def is_overlapping(s1, e1, s2, e2):
     return s1 < e2 and e1 > s2
 
-def solve_scheduling_optimized(df, start_str, pauses):
+def solve_scheduling_with_tables(df, start_str, pauses):
     try:
         start_str = start_str.replace(".", ":")
         global_start = datetime.strptime(start_str, "%H:%M")
     except: return None
 
-    teacher_counts = pd.concat([df['Lærer1'], df['Lærer2']]).value_counts().to_dict()
-    df['priority'] = df.apply(lambda r: teacher_counts.get(r['Lærer1'], 0) + teacher_counts.get(r['Lærer2'], 0), axis=1)
+    # Find travle lærere for prioritering
+    t_counts = pd.concat([df['Lærer1'], df['Lærer2']]).value_counts().to_dict()
+    df['priority'] = df.apply(lambda r: t_counts.get(r['Lærer1'], 0) + t_counts.get(r['Lærer2'], 0), axis=1)
     df = df.sort_values(by='priority', ascending=False)
 
-    teacher_busy = {}
+    teacher_busy = {} # {lærer: [(start, slut)]}
     results = []
 
+    # 1. Planlæg tiderne først (samme logik som før)
     for _, row in df.iterrows():
         l1, l2 = str(row['Lærer1']).strip(), str(row['Lærer2']).strip()
-        current_attempt = global_start
-        found_slot = False
-        
-        while not found_slot:
-            attempt_end = current_attempt + timedelta(minutes=varighed)
+        curr = global_start
+        found = False
+        while not found:
+            endt = curr + timedelta(minutes=varighed)
+            p_overlap = any(is_overlapping(curr, endt, ps, pe) for ps, pe in pauses)
+            if p_overlap:
+                curr = next(pe for ps, pe in pauses if is_overlapping(curr, endt, ps, pe))
+                continue
             
-            overlap_pause = False
-            for p_s, p_e in pauses:
-                if is_overlapping(current_attempt, attempt_end, p_s, p_e):
-                    current_attempt = p_e
-                    overlap_pause = True
-                    break
-            if overlap_pause: continue
-            
-            conflict = False
+            t_conflict = False
             for l in set([l1, l2]):
-                for b_s, b_e in teacher_busy.get(l, []):
-                    if is_overlapping(current_attempt, attempt_end, b_s, b_e):
-                        current_attempt = b_e
-                        conflict = True
-                        break
-                if conflict: break
-            
-            if not conflict:
-                found_slot = True
-            else: continue
+                if any(is_overlapping(curr, endt, bs, be) for bs, be in teacher_busy.get(l, [])):
+                    curr = next(be for bs, be in teacher_busy.get(l, []) if is_overlapping(curr, endt, bs, be))
+                    t_conflict = True; break
+            if not t_conflict: found = True
         
         for l in set([l1, l2]):
             if l not in teacher_busy: teacher_busy[l] = []
-            teacher_busy[l].append((current_attempt, attempt_end))
+            teacher_busy[l].append((curr, endt))
             teacher_busy[l].sort()
-            
+        
         res = row.to_dict()
-        res.update({'Starttid': current_attempt.strftime("%H:%M"), 'Sluttid': attempt_end.strftime("%H:%M")})
+        res.update({'start_dt': curr, 'end_dt': endt, 'Starttid': curr.strftime("%H:%M"), 'Sluttid': endt.strftime("%H:%M")})
         results.append(res)
 
-    res_df = pd.DataFrame(results)
-    if 'priority' in res_df.columns: res_df = res_df.drop(columns=['priority'])
+    res_df = pd.DataFrame(results).sort_values(by='start_dt')
+
+    # 2. Tildel borde med "Stay-put" logik
+    table_occupied_until = {} # {bord_nr: datetime}
+    teacher_home_table = {}   # {lærer_initialer: bord_nr}
     
-    all_times = sorted(res_df['Starttid'].unique())
-    for t in all_times:
-        simultaneous = res_df[res_df['Starttid'] == t]
-        for i, idx in enumerate(simultaneous.index):
-            res_df.at[idx, 'Bord'] = f"Bord {i+1}"
+    final_rows = []
+    # Vi går gennem vejledningerne kronologisk
+    for _, row in res_df.iterrows():
+        l1, l2 = str(row['Lærer1']).strip(), str(row['Lærer2']).strip()
+        s_dt, e_dt = row['start_dt'], row['end_dt']
+        
+        assigned_table = None
+        
+        # Prøv at finde et ledigt bord blandt lærernes tidligere borde
+        pref_tables = []
+        if l1 in teacher_home_table: pref_tables.append(teacher_home_table[l1])
+        if l2 in teacher_home_table: pref_tables.append(teacher_home_table[l2])
+        
+        for t_nr in pref_tables:
+            if table_occupied_until.get(t_nr, global_start) <= s_dt:
+                assigned_table = t_nr
+                break
+        
+        # Hvis ingen af deres faste borde er ledige, tag det første ledige bord
+        if assigned_table is None:
+            t_nr = 1
+            while True:
+                if table_occupied_until.get(t_nr, global_start) <= s_dt:
+                    assigned_table = t_nr
+                    break
+                t_nr += 1
+        
+        # Opdater hvem der "ejer" bordet nu (den mest travle lærer 'vinder' ejerskabet)
+        if t_counts.get(l1, 0) >= t_counts.get(l2, 0):
+            teacher_home_table[l1] = assigned_table
+        else:
+            teacher_home_table[l2] = assigned_table
             
-    return res_df.sort_values(by=['Starttid', 'Bord'])
+        table_occupied_until[assigned_table] = e_dt
+        row['Bord'] = f"Bord {assigned_table}"
+        final_rows.append(row)
+
+    final_df = pd.DataFrame(final_rows).drop(columns=['priority', 'start_dt', 'end_dt'])
+    return final_df.sort_values(by=['Starttid', 'Bord'])
 
 # --- UI ---
 st.markdown("---")
-st.subheader("Upload din plan")
-st.write("**Regnearket skal have præcis disse overskrifter i første række:**")
-st.code("K.id., Fornavn, Efternavn, Fag1, Lærer1, Fag2, Lærer2")
-
+st.write("**Overskrifter:** K.id., Fornavn, Efternavn, Fag1, Lærer1, Fag2, Lærer2")
 uploaded_file = st.file_uploader("", type=["xlsx"])
 
 if uploaded_file:
     try:
         input_df = pd.read_excel(uploaded_file)
         pauser = parse_pauser(pause_input)
-        result = solve_scheduling_optimized(input_df, start_tid_str, pauser)
+        result = solve_scheduling_with_tables(input_df, start_tid_str, pauser)
         
         if result is not None:
-            st.success(f"✅ Planlægning færdig! Sidste vejledning slutter kl. {result['Sluttid'].max()}")
+            st.success(f"✅ Færdig! Sidste vejledning slutter kl. {result['Sluttid'].max()}")
             
             def get_excel(data, mode):
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     if mode == 'laerer':
                         data.to_excel(writer, sheet_name='Samlet Plan', index=False)
-                        alle_l = sorted(list(set(data['Lærer1'].astype(str)) | set(data['Lærer2'].astype(str))))
-                        for l in alle_l:
-                            l_df = data[(data['Lærer1'] == l) | (data['Lærer2'] == l)]
-                            l_name = f"Lærer {l}"[:31]
-                            l_df.to_excel(writer, sheet_name=l_name, index=False)
+                        for l in sorted(list(set(data['Lærer1'].astype(str)) | set(data['Lærer2'].astype(str)))):
+                            data[(data['Lærer1']==l)|(data['Lærer2']==l)].to_excel(writer, sheet_name=f"Lærer {l[:25]}", index=False)
                     else:
                         data.sort_values(['Fornavn', 'Efternavn']).to_excel(writer, sheet_name='Navne', index=False)
                         d_temp = data.copy()
