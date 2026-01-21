@@ -73,7 +73,7 @@ def solve_final_logic(df, start_str, pauses):
     all_teachers = sorted(t_counts.keys(), key=lambda x: (t_counts[x], x), reverse=True)
     teacher_rank = {teacher: i for i, teacher in enumerate(all_teachers)}
 
-    # 2. Planlæg tider (Sikrer uafbrudte stimer for makkerpar)
+    # 2. Planlæg tider (Stimer)
     df['pair_key'] = df.apply(lambda r: tuple(sorted([str(r['Lærer1']).strip(), str(r['Lærer2']).strip()])), axis=1)
     pair_groups = df.groupby('pair_key')
     
@@ -119,10 +119,9 @@ def solve_final_logic(df, start_str, pauses):
                 teacher_busy_slots[teacher].sort()
             temp_start = temp_end
 
-    # 3. Bordplanlægning (STIME-LOGIK: Undgå flyt for par)
+    # 3. Bordplanlægning (Look-ahead)
     planned_times.sort(key=lambda x: x['s_dt'])
     
-    # Find max concurrent til hjem-borde
     time_points = []
     for s in planned_times:
         time_points.append((s['s_dt'], 1))
@@ -135,9 +134,7 @@ def solve_final_logic(df, start_str, pauses):
         max_concurrent = max(max_concurrent, c_count)
 
     teacher_home_table = {all_teachers[i]: i+1 for i in range(min(len(all_teachers), max_concurrent))}
-    table_occupied_slots = [] # Liste af (bord, start, slut)
-    
-    # Vi bruger en ordbog til at huske om et par allerede er i gang med en stime ved et bord
+    table_occupied_slots = []
     pair_active_streak = {} 
     final_sessions = []
 
@@ -147,33 +144,26 @@ def solve_final_logic(df, start_str, pauses):
         pair_key = s['pair_key']
         
         assigned_table = None
-
-        # 1. Tjek om parret allerede har et bord fra forrige session (Sticky Streak)
         if pair_key in pair_active_streak:
             assigned_table = pair_active_streak[pair_key]
         
-        # 2. Hvis ny stime, find det bedste bord til HELE stimens varighed
         if assigned_table is None:
-            # Hvor længe varer deres stime? (Hvor mange sammenhængende vejledninger har de nu?)
             streak_end = end
             for next_s in planned_times[i+1:]:
                 if next_s['pair_key'] == pair_key and next_s['s_dt'] == streak_end:
                     streak_end = next_s['e_dt']
                 elif next_s['s_dt'] > streak_end: break
             
-            # Find hjem-borde
             h1 = teacher_home_table.get(l1); h2 = teacher_home_table.get(l2)
             preferred_tables = []
             if h1 and h2: preferred_tables = [h1] if teacher_rank[l1] < teacher_rank[l2] else [h2]
             elif h1: preferred_tables = [h1]
             elif h2: preferred_tables = [h2]
 
-            # Prøv foretrukne borde først
             for pt in preferred_tables:
                 if not any(pt == occ_t and is_overlapping(start, streak_end, os, oe) for occ_t, os, oe in table_occupied_slots):
                     assigned_table = pt; break
             
-            # Ellers find laveste ledige bord til hele stimen
             if assigned_table is None:
                 t_nr = 1
                 while assigned_table is None:
@@ -181,11 +171,9 @@ def solve_final_logic(df, start_str, pauses):
                         assigned_table = t_nr
                     else: t_nr += 1
             
-            # Husk bordet til resten af stimen
             if streak_end > end:
                 pair_active_streak[pair_key] = assigned_table
 
-        # Ryd parret fra aktive stimer hvis dette er deres sidste vejledning i stimen
         is_last_in_streak = True
         for next_s in planned_times[i+1:]:
             if next_s['pair_key'] == pair_key and next_s['s_dt'] == end:
@@ -193,7 +181,6 @@ def solve_final_logic(df, start_str, pauses):
         if is_last_in_streak and pair_key in pair_active_streak:
             del pair_active_streak[pair_key]
 
-        # Book bordet for denne specifikke session
         table_occupied_slots.append((assigned_table, start, end))
         s['bord_nr'] = assigned_table
         
@@ -204,7 +191,7 @@ def solve_final_logic(df, start_str, pauses):
         final_sessions.append(res)
 
     res_df = pd.DataFrame(final_sessions)
-    return res_df.sort_values(by=['Starttid', 'bord_nr']), global_start
+    return res_df.sort_values(by=['Starttid', 'bord_nr']), teacher_rank
 
 # --- FORSIDE ---
 st.markdown("---")
@@ -217,14 +204,13 @@ if uploaded_file:
     try:
         input_df = pd.read_excel(uploaded_file)
         pauser = parse_pauser(pause_input)
-        result, g_start = solve_final_logic(input_df, start_tid_str, pauser)
+        result, t_rank = solve_final_logic(input_df, start_tid_str, pauser)
         
         if result is not None:
-            st.success(f"✅ Planlægning færdig! Sidste vejledning slutter kl. {result['Sluttid'].max()}")
+            st.success(f"✅ Planlægning færdig!")
             
             def get_excel(data, mode):
                 output = io.BytesIO()
-                # Fjern hjælpekolonner før eksport
                 export_df = data.drop(columns=['pair_key', 's_dt', 'e_dt', 'bord_nr'], errors='ignore')
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     if mode == 'laerer':
@@ -248,56 +234,37 @@ if uploaded_file:
             c2.download_button("🎓 Hent Elev-planer", get_excel(result, 'elev'), "elev_planer.xlsx")
             c3.download_button("🖼️ Hent Bord-planer", get_excel(result, 'bord'), "bord_planer.xlsx")
 
-            # --- STATUS: ANALYSE AF HULLER ---
+            # --- RANGERING AF LÆRERE ---
             st.markdown("---")
-            st.subheader("📝 Status: Reelle huller i planen")
-            
-            def get_actual_gaps(gap_s, gap_e, pause_list, min_dur):
-                segments = [(gap_s, gap_e)]
-                for p_s, p_e in pause_list:
-                    new_segments = []
-                    for s_s, s_e in segments:
-                        if p_e <= s_s or p_s >= s_e:
-                            new_segments.append((s_s, s_e))
-                        else:
-                            if p_s > s_s: new_segments.append((s_s, p_s))
-                            if p_e < s_e: new_segments.append((p_e, s_e))
-                    segments = new_segments
-                return [s for s in segments if (s[1] - s[0]).total_seconds() >= (min_dur * 60 - 10)]
-
-            gap_report = []
-            max_b = int(result['bord_nr'].max())
-            last_time_overall = datetime.strptime(result['Sluttid'].max(), "%H:%M")
-            
-            for b in range(1, max_b + 1):
-                b_sessions = result[result['bord_nr'] == b].sort_values('s_dt')
-                if b_sessions.empty:
-                    gap_report.append(f"Bord {b}: Helt ledigt.")
-                    continue
+            st.subheader("📊 Læreroversigt (Travlhed & Stabilitet)")
+            teachers_in_plan = sorted(list(set(result['Lærer1'].astype(str)) | set(result['Lærer2'].astype(str))))
+            ranking_data = []
+            for t in teachers_in_plan:
+                t_sessions = result[(result['Lærer1'] == t) | (result['Lærer2'] == t)].sort_values('s_dt')
+                count = len(t_sessions)
                 
-                table_raw_gaps = []
-                if b_sessions.iloc[0]['s_dt'] > g_start:
-                    table_raw_gaps.append((g_start, b_sessions.iloc[0]['s_dt']))
-                for i in range(len(b_sessions)-1):
-                    curr_e = b_sessions.iloc[i]['e_dt']
-                    next_s = b_sessions.iloc[i+1]['s_dt']
-                    if next_s > curr_e:
-                        table_raw_gaps.append((curr_e, next_s))
-                if b_sessions.iloc[-1]['e_dt'] < last_time_overall:
-                    table_raw_gaps.append((b_sessions.iloc[-1]['e_dt'], last_time_overall))
+                switches_info = []
+                prev_table = None
+                for idx, row in t_sessions.iterrows():
+                    curr_table = row['Bord']
+                    if prev_table and curr_table != prev_table:
+                        other = row['Lærer2'] if row['Lærer1'] == t else row['Lærer1']
+                        rank_type = "Højere" if t_rank[other] < t_rank[t] else "Lavere"
+                        switches_info.append(f"Til {curr_table} pga. {other} ({rank_type} rang)")
+                    prev_table = curr_table
                 
-                final_gaps_for_table = []
-                for gs, ge in table_raw_gaps:
-                    filtered = get_actual_gaps(gs, ge, pauser, varighed)
-                    for f_s, f_e in filtered:
-                        final_gaps_for_table.append(f"{f_s.strftime('%H:%M')}-{f_e.strftime('%H:%M')}")
+                skifter = "🔴 Ja" if len(switches_info) > 0 else "🟢 Nej"
+                detaljer = ", ".join(switches_info) if switches_info else "Ingen"
                 
-                if final_gaps_for_table:
-                    gap_report.append(f"Bord {b}: Ledigt kl. " + ", ".join(final_gaps_for_table))
-                else:
-                    gap_report.append(f"Bord {b}: Fuldt booket.")
+                ranking_data.append({
+                    "Lærer": t, 
+                    "Antal vejledninger": count, 
+                    "Skal skifte bord": skifter,
+                    "Årsag til skift": detaljer
+                })
             
-            st.text_area("Oversigt over ledige tider pr. bord (huller kortere end en vejledning er skjult):", value="\\n".join(gap_report), height=300)
+            ranking_df = pd.DataFrame(ranking_data).sort_values("Antal vejledninger", ascending=False)
+            st.dataframe(ranking_df, use_container_width=True, hide_index=True)
 
     except Exception as e:
         st.error(f"Der skete en fejl: {e}")
