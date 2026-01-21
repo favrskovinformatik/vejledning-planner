@@ -119,9 +119,10 @@ def solve_final_logic(df, start_str, pauses):
                 teacher_busy_slots[teacher].sort()
             temp_start = temp_end
 
-    # 3. Bordplanlægning (Look-ahead)
+    # 3. Bordplanlægning (Forbedret stabilitet)
     planned_times.sort(key=lambda x: x['s_dt'])
     
+    # Max samtidige
     time_points = []
     for s in planned_times:
         time_points.append((s['s_dt'], 1))
@@ -133,9 +134,19 @@ def solve_final_logic(df, start_str, pauses):
         c_count += delta
         max_concurrent = max(max_concurrent, c_count)
 
+    # Hjem-borde (De mest travle får førsteret)
     teacher_home_table = {all_teachers[i]: i+1 for i in range(min(len(all_teachers), max_concurrent))}
+    
+    # Oversigt over hvornår hjem-borde SKAL bruges af deres ejere
+    home_table_reservations = {i+1: [] for i in range(max_concurrent)}
+    for s in planned_times:
+        l1, l2 = str(s['Lærer1']).strip(), str(s['Lærer2']).strip()
+        for l in [l1, l2]:
+            if l in teacher_home_table:
+                home_table_reservations[teacher_home_table[l]].append((s['s_dt'], s['e_dt']))
+
     table_occupied_slots = []
-    pair_active_streak = {} 
+    teacher_last_table = {} 
     final_sessions = []
 
     for i, s in enumerate(planned_times):
@@ -143,45 +154,64 @@ def solve_final_logic(df, start_str, pauses):
         start, end = s['s_dt'], s['e_dt']
         pair_key = s['pair_key']
         
-        assigned_table = None
-        if pair_key in pair_active_streak:
-            assigned_table = pair_active_streak[pair_key]
-        
-        if assigned_table is None:
-            streak_end = end
-            for next_s in planned_times[i+1:]:
-                if next_s['pair_key'] == pair_key and next_s['s_dt'] == streak_end:
-                    streak_end = next_s['e_dt']
-                elif next_s['s_dt'] > streak_end: break
-            
-            h1 = teacher_home_table.get(l1); h2 = teacher_home_table.get(l2)
-            preferred_tables = []
-            if h1 and h2: preferred_tables = [h1] if teacher_rank[l1] < teacher_rank[l2] else [h2]
-            elif h1: preferred_tables = [h1]
-            elif h2: preferred_tables = [h2]
-
-            for pt in preferred_tables:
-                if not any(pt == occ_t and is_overlapping(start, streak_end, os, oe) for occ_t, os, oe in table_occupied_slots):
-                    assigned_table = pt; break
-            
-            if assigned_table is None:
-                t_nr = 1
-                while assigned_table is None:
-                    if not any(t_nr == occ_t and is_overlapping(start, streak_end, os, oe) for occ_t, os, oe in table_occupied_slots):
-                        assigned_table = t_nr
-                    else: t_nr += 1
-            
-            if streak_end > end:
-                pair_active_streak[pair_key] = assigned_table
-
-        is_last_in_streak = True
+        # Find stimens slutning
+        streak_end = end
         for next_s in planned_times[i+1:]:
-            if next_s['pair_key'] == pair_key and next_s['s_dt'] == end:
-                is_last_in_streak = False; break
-        if is_last_in_streak and pair_key in pair_active_streak:
-            del pair_active_streak[pair_key]
+            if next_s['pair_key'] == pair_key and next_s['s_dt'] == streak_end:
+                streak_end = next_s['e_dt']
+            elif next_s['s_dt'] > streak_end: break
 
+        assigned_table = None
+
+        # PRIORITET 1: Sidder en af dem allerede ved et ledigt bord? (Bliv siddende)
+        # Vi prioriterer den mest travle lærers nuværende bord
+        sorted_pair = sorted([l1, l2], key=lambda x: teacher_rank[x])
+        for p_member in sorted_pair:
+            prev_t = teacher_last_table.get(p_member)
+            if prev_t:
+                # Tjek om bordet er ledigt i hele STIMENS varighed
+                if not any(prev_t == occ_t and is_overlapping(start, streak_end, os, oe) for occ_t, os, oe in table_occupied_slots):
+                    # Tjek om vi "stjæler" fra en ejer i fremtiden
+                    if prev_t in home_table_reservations:
+                        owner_conflict = False
+                        for r_s, r_e in home_table_reservations[prev_t]:
+                            if is_overlapping(start, streak_end, r_s, r_e):
+                                # Hvis ingen af os ejer bordet, er det en konflikt
+                                if not (l1 in teacher_home_table and teacher_home_table[l1] == prev_t) and \
+                                   not (l2 in teacher_home_table and teacher_home_table[l2] == prev_t):
+                                    owner_conflict = True; break
+                        if not owner_conflict:
+                            assigned_table = prev_t; break
+            if assigned_table: break
+
+        # PRIORITET 2: Hvis ingen sad ved et egnet bord, prøv den travleste lærers HJEM-BORD
+        if assigned_table is None:
+            for p_member in sorted_pair:
+                h_t = teacher_home_table.get(p_member)
+                if h_t:
+                    if not any(h_t == occ_t and is_overlapping(start, streak_end, os, oe) for occ_t, os, oe in table_occupied_slots):
+                        assigned_table = h_t; break
+
+        # PRIORITET 3: Find det laveste ledige bord der ikke er reserveret til en ejer i stime-perioden
+        if assigned_table is None:
+            t_nr = 1
+            while assigned_table is None:
+                if not any(t_nr == occ_t and is_overlapping(start, streak_end, os, oe) for occ_t, os, oe in table_occupied_slots):
+                    # Tjek fremtidig ejer-konflikt
+                    if t_nr in home_table_reservations:
+                        owner_conflict = False
+                        for r_s, r_e in home_table_reservations[t_nr]:
+                            if is_overlapping(start, streak_end, r_s, r_e):
+                                owner_conflict = True; break
+                        if not owner_conflict: assigned_table = t_nr
+                    else:
+                        assigned_table = t_nr
+                t_nr += 1
+
+        # Book og gem
         table_occupied_slots.append((assigned_table, start, end))
+        teacher_last_table[l1] = assigned_table
+        teacher_last_table[l2] = assigned_table
         s['bord_nr'] = assigned_table
         
         res = {**s}
@@ -249,8 +279,8 @@ if uploaded_file:
                     curr_table = row['Bord']
                     if prev_table and curr_table != prev_table:
                         other = row['Lærer2'] if row['Lærer1'] == t else row['Lærer1']
-                        rank_type = "Højere" if t_rank[other] < t_rank[t] else "Lavere"
-                        switches_info.append(f"Til {curr_table} pga. {other} ({rank_type} rang)")
+                        rank_diff = "Højere" if t_rank[other] < t_rank[t] else "Lavere"
+                        switches_info.append(f"Til {curr_table} pga. {other} ({rank_diff} rang)")
                     prev_table = curr_table
                 
                 skifter = "🔴 Ja" if len(switches_info) > 0 else "🟢 Nej"
