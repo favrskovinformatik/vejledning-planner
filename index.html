@@ -79,7 +79,6 @@ def solve_final_logic(df, start_str, pauses):
     
     sorted_groups = []
     for key, group in pair_groups:
-        # Vægtning: Flest sessioner sammen prioriteres højest
         weight = len(group) * 1000 + (1000 - teacher_rank.get(key[0], 999)) + (1000 - teacher_rank.get(key[1], 999))
         sorted_groups.append({'key': key, 'data': group, 'weight': weight})
     sorted_groups = sorted(sorted_groups, key=lambda x: x['weight'], reverse=True)
@@ -99,7 +98,6 @@ def solve_final_logic(df, start_str, pauses):
             block_start = curr
             block_end = curr + timedelta(minutes=total_needed_minutes)
             
-            # Tjek pauser
             overlap_pause = False
             for ps, pe in pauses:
                 if is_overlapping(block_start, block_end, ps, pe):
@@ -108,7 +106,6 @@ def solve_final_logic(df, start_str, pauses):
                     break
             if overlap_pause: continue
 
-            # Tjek lærerkonflikter
             conflict = False
             for teacher in pair:
                 if any(is_overlapping(block_start, block_end, bs, be) for bs, be in teacher_busy_slots[teacher]):
@@ -120,7 +117,6 @@ def solve_final_logic(df, start_str, pauses):
             if not conflict:
                 found_block = True
         
-        # Book tider
         temp_start = block_start
         for s in sessions_in_group:
             temp_end = temp_start + timedelta(minutes=varighed)
@@ -175,7 +171,6 @@ def solve_final_logic(df, start_str, pauses):
         final_results.append(s)
 
     res_df = pd.DataFrame(final_results)
-    # FJERN kun de kolonner der faktisk er oprettet
     cols_to_drop = [c for c in ['pair_key', 's_dt', 'e_dt'] if c in res_df.columns]
     return res_df.drop(columns=cols_to_drop).sort_values(by=['Starttid', 'bord_nr'])
 
@@ -195,6 +190,20 @@ if uploaded_file:
         if result is not None:
             st.success(f"✅ Planlægning færdig! Sidste vejledning slutter kl. {result['Sluttid'].max()}")
             
+            # --- RANGERING AF LÆRERE ---
+            st.subheader("📊 Læreroversigt (Travlhed & Stabilitet)")
+            teachers = sorted(list(set(result['Lærer1'].astype(str)) | set(result['Lærer2'].astype(str))))
+            ranking_data = []
+            for t in teachers:
+                t_sessions = result[(result['Lærer1'] == t) | (result['Lærer2'] == t)].sort_values('Starttid')
+                count = len(t_sessions)
+                borde = t_sessions['Bord'].unique()
+                skifter = "🔴 Ja" if len(borde) > 1 else "🟢 Nej"
+                ranking_data.append({"Lærer": t, "Antal vejledninger": count, "Skal skifte bord": skifter})
+            
+            ranking_df = pd.DataFrame(ranking_data).sort_values("Antal vejledninger", ascending=False)
+            st.dataframe(ranking_df, use_container_width=True, hide_index=True)
+
             def get_excel(data, mode):
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
