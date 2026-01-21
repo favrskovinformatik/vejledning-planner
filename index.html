@@ -82,12 +82,12 @@ def solve_final_logic(df, start_str, pauses):
         global_start = datetime.strptime(start_str, "%H:%M")
     except: return None
 
-    # 1. Beregn belastning (uændret)
+    # 1. Belastning og rangering
     t_counts = pd.concat([df['Lærer1'], df['Lærer2']]).astype(str).str.strip().value_counts().to_dict()
     all_teachers = sorted(t_counts.keys(), key=lambda x: (t_counts[x], x), reverse=True)
     teacher_rank = {teacher: i for i, teacher in enumerate(all_teachers)}
 
-    # 2. Planlæg tider for maksimal kompakthed (uændret)
+    # 2. Planlæg tider (Maksimal kompakthed)
     df['priority'] = df.apply(lambda r: t_counts.get(str(r['Lærer1']).strip(), 0) + t_counts.get(str(r['Lærer2']).strip(), 0), axis=1)
     df_sorted = df.sort_values(by='priority', ascending=False)
     
@@ -116,50 +116,47 @@ def solve_final_logic(df, start_str, pauses):
             teacher_busy_slots[l].sort()
         planned_sessions.append({**row.to_dict(), 's_dt': curr, 'e_dt': endt})
 
-    # 3. Tildel borde med "Sticky Logic" (NY OG FORBEDRET)
+    # 3. Tildel borde (Minimerer flyt for travle lærere)
     sessions = sorted(planned_sessions, key=lambda x: x['s_dt'])
     
-    teacher_last_table = {}  # Husker hvor læreren sidst sad
-    table_occupied_until = {} # Husker hvornår et bord er ledigt
+    time_points = []
+    for s in sessions:
+        time_points.append((s['s_dt'], 1))
+        time_points.append((s['e_dt'], -1))
+    time_points.sort()
+    max_concurrent = 0
+    current = 0
+    for _, delta in time_points:
+        current += delta
+        max_concurrent = max(max_concurrent, current)
+
+    # De mest travle lærere får faste borde
+    permanent_teachers = all_teachers[:max_concurrent]
+    teacher_fixed_table = {t: i+1 for i, t in enumerate(permanent_teachers)}
+    
+    table_occupied_until = {} 
     final_results = []
     
     for s in sessions:
         l1, l2 = str(s['Lærer1']).strip(), str(s['Lærer2']).strip()
         start, end = s['s_dt'], s['e_dt']
-        
-        # Find ud af om lærerne allerede har et bord fra en tidligere session
-        t1 = teacher_last_table.get(l1)
-        t2 = teacher_last_table.get(l2)
-        
-        # Tjek om deres tidligere borde er ledige nu
-        t1_is_free = t1 and table_occupied_until.get(t1, global_start) <= start
-        t2_is_free = t2 and table_occupied_until.get(t2, global_start) <= start
-        
+        host = l1 if teacher_rank[l1] < teacher_rank[l2] else l2
+        guest = l2 if host == l1 else l1
         assigned_table = None
         
-        # STRATEGI:
-        # A. Hvis begge har et bord, vælg bordet fra den mest travle lærer
-        if t1_is_free and t2_is_free:
-            assigned_table = t1 if teacher_rank[l1] <= teacher_rank[l2] else t2
-        # B. Hvis kun Lærer 1 har et ledigt bord
-        elif t1_is_free:
-            assigned_table = t1
-        # C. Hvis kun Lærer 2 har et ledigt bord
-        elif t2_is_free:
-            assigned_table = t2
-        # D. Ingen har et bord -> Find det laveste ledige bordnummer (genbrug)
-        else:
-            t_nr = 1
+        if host in teacher_fixed_table:
+            assigned_table = teacher_fixed_table[host]
+        elif guest in teacher_fixed_table:
+            assigned_table = teacher_fixed_table[guest]
+        
+        if assigned_table is None:
+            t_nr = max_concurrent + 1
             while True:
                 if table_occupied_until.get(t_nr, global_start) <= start:
                     assigned_table = t_nr
+                    table_occupied_until[t_nr] = end
                     break
                 t_nr += 1
-        
-        # Opdater databaserne
-        table_occupied_until[assigned_table] = end
-        teacher_last_table[l1] = assigned_table
-        teacher_last_table[l2] = assigned_table
         
         s.update({
             'Starttid': start.strftime("%H:%M"),
