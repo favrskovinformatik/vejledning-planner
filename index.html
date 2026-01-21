@@ -1,3 +1,24 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <title>Vejledningsplanlægger</title>
+    
+    <!-- Sikrer kompatibilitet i Safari og Firefox -->
+    <script src="https://cdn.jsdelivr.net/gh/gzuidhof/coi-serviceworker@latest/coi-serviceworker.min.js"></script>
+    
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.js"></script>
+    <script>
+      stlite.mount({
+        requirements: ["pandas", "openpyxl"],
+        files: {
+          "streamlit_app.py": `
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
@@ -6,7 +27,7 @@ import re
 
 st.set_page_config(page_title="Vejledningsplanlægger", layout="wide")
 
-# CSS: Sikrer pæn sidebar
+# CSS: Sikrer pæn sidebar uden mærkelige linjeskift
 st.markdown("""
 <style>
     [data-testid="stSidebar"] { min-width: 400px !important; }
@@ -23,13 +44,27 @@ st.info("Denne app kører 100% lokalt i din browser (GDPR-sikker).")
 # --- SIDEBAR: INDSTILLINGER ---
 st.sidebar.header("Indstillinger")
 
-start_tid_str = st.sidebar.text_input("Starttidspunkt (tt.mm)", value="08:15")
-varighed = st.sidebar.number_input("Minutter pr. vejledning", value=15)
-pause_input = st.sidebar.text_area("Pauser", value="09:50-10:10, 11:45-12:15, 13:50-14:00")
+start_tid_str = st.sidebar.text_input(
+    "Starttidspunkt (tt.mm)", 
+    value="08:15",
+    help="Indtast hvornår første vejledning starter (f.eks. 08:00)."
+)
+
+varighed = st.sidebar.number_input(
+    "Minutter pr. vejledning", 
+    value=15,
+    help="Standard er 15 minutter."
+)
+
+pause_input = st.sidebar.text_area(
+    "Pauser", 
+    value="09:50-10:10, 11:45-12:15, 13:50-14:00",
+    help="Format: start-slut. Adskil flere pauser med komma."
+)
 
 def parse_pauser(pause_str):
     pauser = []
-    matches = re.findall(r"(\d{1,2}[:.]\d{2})\s*-\s*(\d{1,2}[:.]\d{2})", pause_str)
+    matches = re.findall(r"(\\d{1,2}[:.]\\d{2})\\s*-\\s*(\\d{1,2}[:.]\\d{2})", pause_str)
     for m in matches:
         try:
             p_s = datetime.strptime(m[0].replace(".", ":"), "%H:%M")
@@ -47,12 +82,12 @@ def solve_final_logic(df, start_str, pauses):
         global_start = datetime.strptime(start_str, "%H:%M")
     except: return None
 
-    # 1. Belastning
+    # 1. Belastning og rangering
     t_counts = pd.concat([df['Lærer1'], df['Lærer2']]).astype(str).str.strip().value_counts().to_dict()
     all_teachers = sorted(t_counts.keys(), key=lambda x: (t_counts[x], x), reverse=True)
     teacher_rank = {teacher: i for i, teacher in enumerate(all_teachers)}
 
-    # 2. Tidsplanlægning
+    # 2. Planlæg tider (Maksimal kompakthed)
     df['priority'] = df.apply(lambda r: t_counts.get(str(r['Lærer1']).strip(), 0) + t_counts.get(str(r['Lærer2']).strip(), 0), axis=1)
     df_sorted = df.sort_values(by='priority', ascending=False)
     
@@ -81,7 +116,7 @@ def solve_final_logic(df, start_str, pauses):
             teacher_busy_slots[l].sort()
         planned_sessions.append({**row.to_dict(), 's_dt': curr, 'e_dt': endt})
 
-    # 3. Bordplanlægning (Look-ahead & No Double Booking)
+    # 3. Tildel borde (Minimerer flyt for travle lærere)
     sessions = sorted(planned_sessions, key=lambda x: x['s_dt'])
     
     time_points = []
@@ -95,58 +130,33 @@ def solve_final_logic(df, start_str, pauses):
         current += delta
         max_concurrent = max(max_concurrent, current)
 
-    teacher_home_table = {t: i+1 for i, t in enumerate(all_teachers[:max_concurrent])}
-    home_table_owner_needs = {i+1: [] for i in range(max_concurrent)}
-    for s in sessions:
-        for l in [str(s['Lærer1']).strip(), str(s['Lærer2']).strip()]:
-            if l in teacher_home_table:
-                home_table_owner_needs[teacher_home_table[l]].append((s['s_dt'], s['e_dt']))
-
+    # De mest travle lærere får faste borde
+    permanent_teachers = all_teachers[:max_concurrent]
+    teacher_fixed_table = {t: i+1 for i, t in enumerate(permanent_teachers)}
+    
     table_occupied_until = {} 
-    teacher_active_streak_table = {} 
     final_results = []
     
-    for i, s in enumerate(sessions):
+    for s in sessions:
         l1, l2 = str(s['Lærer1']).strip(), str(s['Lærer2']).strip()
         start, end = s['s_dt'], s['e_dt']
-        pair_key = tuple(sorted([l1, l2]))
-        
+        host = l1 if teacher_rank[l1] < teacher_rank[l2] else l2
+        guest = l2 if host == l1 else l1
         assigned_table = None
-
-        if pair_key in teacher_active_streak_table:
-            potential_table = teacher_active_streak_table[pair_key]
-            if table_occupied_until.get(potential_table, global_start) <= start:
-                assigned_table = potential_table
-
-        if assigned_table is None:
-            streak_end = end
-            for next_s in sessions[i+1:]:
-                if tuple(sorted([str(next_s['Lærer1']).strip(), str(next_s['Lærer2']).strip()])) == pair_key and next_s['s_dt'] == streak_end:
-                    streak_end = next_s['e_dt']
-                elif next_s['s_dt'] > streak_end: break
-
-            t_nr = 1
-            while assigned_table is None:
-                if table_occupied_until.get(t_nr, global_start) <= start:
-                    conflict = False
-                    if t_nr in home_table_owner_needs:
-                        for o_s, o_e in home_table_owner_needs[t_nr]:
-                            if is_overlapping(start, streak_end, o_s, o_e):
-                                if not (l1 in teacher_home_table and teacher_home_table[l1] == t_nr) and \
-                                   not (l2 in teacher_home_table and teacher_home_table[l2] == t_nr):
-                                    conflict = True; break
-                    if not conflict: assigned_table = t_nr
-                t_nr += 1
-
-        table_occupied_until[assigned_table] = end
         
-        # Opdater stime-hukommelse
-        has_next = False
-        for next_s in sessions[i+1:]:
-            if tuple(sorted([str(next_s['Lærer1']).strip(), str(next_s['Lærer2']).strip()])) == pair_key and next_s['s_dt'] == end:
-                has_next = True; break
-        if has_next: teacher_active_streak_table[pair_key] = assigned_table
-        elif pair_key in teacher_active_streak_table: del teacher_active_streak_table[pair_key]
+        if host in teacher_fixed_table:
+            assigned_table = teacher_fixed_table[host]
+        elif guest in teacher_fixed_table:
+            assigned_table = teacher_fixed_table[guest]
+        
+        if assigned_table is None:
+            t_nr = max_concurrent + 1
+            while True:
+                if table_occupied_until.get(t_nr, global_start) <= start:
+                    assigned_table = t_nr
+                    table_occupied_until[t_nr] = end
+                    break
+                t_nr += 1
         
         s.update({
             'Starttid': start.strftime("%H:%M"),
@@ -157,13 +167,13 @@ def solve_final_logic(df, start_str, pauses):
         final_results.append(s)
 
     res_df = pd.DataFrame(final_results)
-    # Vi beholder bord_nr her, så download-funktionen kan bruge den
     return res_df.drop(columns=['priority', 's_dt', 'e_dt']).sort_values(by=['Starttid', 'bord_nr'])
 
 # --- FORSIDE ---
 st.markdown("---")
 st.subheader("Instruktion")
-st.write("Upload Excel-ark med kolonner: K.id., Fornavn, Efternavn, Fag1, Lærer1, Fag2, Lærer2")
+st.write("Vælg de relevante indstillinger til venstre og upload derefter et Excel-ark med følgende kolonner i første række:")
+st.code("K.id., Fornavn, Efternavn, Fag1, Lærer1, Fag2, Lærer2")
 
 uploaded_file = st.file_uploader("Vælg Excel-fil", type=["xlsx"])
 
@@ -177,24 +187,21 @@ if uploaded_file:
             st.success(f"✅ Planlægning færdig! Sidste vejledning slutter kl. {result['Sluttid'].max()}")
             
             def get_excel(data, mode):
-                # Vi laver en kopi og sletter 'bord_nr' lige før skrivning til Excel
-                export_data = data.copy()
-                
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     if mode == 'laerer':
-                        export_data.drop(columns=['bord_nr']).to_excel(writer, sheet_name='Samlet Plan', index=False)
+                        data.to_excel(writer, sheet_name='Samlet Plan', index=False)
                         for l in sorted(list(set(data['Lærer1'].astype(str)) | set(data['Lærer2'].astype(str)))):
-                            data[(data['Lærer1']==l)|(data['Lærer2']==l)].drop(columns=['bord_nr']).to_excel(writer, sheet_name=f"Lærer {l[:25]}", index=False)
+                            data[(data['Lærer1']==l)|(data['Lærer2']==l)].to_excel(writer, sheet_name=f"Lærer {l[:25]}", index=False)
                     elif mode == 'elev':
-                        export_data.sort_values(['Fornavn', 'Efternavn']).drop(columns=['bord_nr']).to_excel(writer, sheet_name='Navne', index=False)
+                        data.sort_values(['Fornavn', 'Efternavn']).to_excel(writer, sheet_name='Navne', index=False)
                         d_t = data.copy(); d_t['Kl'] = d_t['K.id.'].astype(str).str[:2]
                         for k in sorted(d_t['Kl'].unique()):
-                            d_t[d_t['Kl']==k].drop(columns=['Kl', 'bord_nr']).to_excel(writer, sheet_name=f"Klasse {k}", index=False)
+                            d_t[d_t['Kl']==k].drop(columns=['Kl']).to_excel(writer, sheet_name=f"Klasse {k}", index=False)
                     elif mode == 'bord':
-                        export_data.drop(columns=['bord_nr']).to_excel(writer, sheet_name='Samlet Plan', index=False)
+                        data.to_excel(writer, sheet_name='Samlet Plan', index=False)
                         for b in sorted(data['bord_nr'].unique()):
-                            data[data['bord_nr']==b].drop(columns=['bord_nr']).to_excel(writer, sheet_name=f"Bord {b}", index=False)
+                            data[data['bord_nr']==b].to_excel(writer, sheet_name=f"Bord {b}", index=False)
                 return output.getvalue()
 
             st.markdown("### Download resultater")
@@ -204,3 +211,9 @@ if uploaded_file:
             c3.download_button("🖼️ Hent Bord-planer", get_excel(result, 'bord'), "bord_planer.xlsx")
     except Exception as e:
         st.error(f"Der skete en fejl: {e}")
+`
+        },
+      });
+    </script>
+  </body>
+</html>
