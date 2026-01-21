@@ -169,7 +169,14 @@ def solve_final_logic(df, start_str, pauses):
                 t_nr += 1
         
         table_occupied_until[assigned_table] = end
-        final_results.append({**s, 'Bord': f"Bord {assigned_table}", 'bord_nr': assigned_table})
+        
+        # Opret det endelige resultat med alle tids-strenge
+        res_entry = {**s}
+        res_entry['Starttid'] = start.strftime("%H:%M")
+        res_entry['Sluttid'] = end.strftime("%H:%M")
+        res_entry['Bord'] = f"Bord {assigned_table}"
+        res_entry['bord_nr'] = assigned_table
+        final_results.append(res_entry)
 
     res_df = pd.DataFrame(final_results)
     cols_to_drop = [c for c in ['pair_key', 's_dt', 'e_dt'] if c in res_df.columns]
@@ -191,7 +198,6 @@ if uploaded_file:
         if result is not None:
             st.success(f"✅ Planlægning færdig! Sidste vejledning slutter kl. {result['Sluttid'].max()}")
             
-            # Hjælpefunktion til Excel-generering
             def get_excel(data, mode):
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -210,7 +216,7 @@ if uploaded_file:
                             data[data['bord_nr']==b].to_excel(writer, sheet_name=f"Bord {b}", index=False)
                 return output.getvalue()
 
-            # --- DOWNLOAD KNAPPER (Flyttet op) ---
+            # --- DOWNLOAD KNAPPER ---
             st.markdown("### 📥 Download resultater")
             c1, c2, c3 = st.columns(3)
             c1.download_button("📂 Hent Lærer-planer", get_excel(result, 'laerer'), "laerer_planer.xlsx")
@@ -219,19 +225,19 @@ if uploaded_file:
 
             st.markdown("---")
 
-            # --- RANGERING AF LÆRERE (Flyttet ned) ---
+            # --- RANGERING AF LÆRERE ---
             st.subheader("📊 Læreroversigt (Travlhed & Stabilitet)")
             teachers_in_plan = sorted(list(set(result['Lærer1'].astype(str)) | set(result['Lærer2'].astype(str))))
             ranking_data = []
             for t in teachers_in_plan:
                 t_sessions = result[(result['Lærer1'] == t) | (result['Lærer2'] == t)].sort_values('Starttid')
                 count = len(t_sessions)
-                borde = t_sessions['Bord'].unique()
-                skifter = "🔴 Ja" if len(borde) > 1 else "🟢 Nej"
+                borde_brugt = t_sessions['Bord'].nunique()
+                skifter = "🔴 Ja" if borde_brugt > 1 else "🟢 Nej"
                 ranking_data.append({
                     "Lærer": t, 
                     "Antal vejledninger": count, 
-                    "Antal borde brugt": len(borde), 
+                    "Antal borde brugt": borde_brugt, 
                     "Skal skifte bord": skifter
                 })
             
