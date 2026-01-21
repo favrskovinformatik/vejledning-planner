@@ -191,7 +191,7 @@ if uploaded_file:
             
             def get_excel(data, mode):
                 output = io.BytesIO()
-                # Fjern bord_nr før eksport
+                # Fjern hjælpekolonner før eksport
                 export_df = data.drop(columns=['pair_key', 's_dt', 'e_dt', 'bord_nr'], errors='ignore')
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     if mode == 'laerer':
@@ -215,10 +215,28 @@ if uploaded_file:
             c2.download_button("🎓 Hent Elev-planer", get_excel(result, 'elev'), "elev_planer.xlsx")
             c3.download_button("🖼️ Hent Bord-planer", get_excel(result, 'bord'), "bord_planer.xlsx")
 
-            # --- STATUS: ANALYSE AF HULLER ---
+            # --- STATUS: ANALYSE AF HULLER (Ekskl. Pauser) ---
             st.markdown("---")
-            st.subheader("📝 Status: Huller i planen")
+            st.subheader("📝 Status: Reelle huller i planen")
             
+            def get_actual_gaps(gap_s, gap_e, pause_list):
+                # Starter med hele hullet som et muligt ledigt tidsrum
+                segments = [(gap_s, gap_e)]
+                for p_s, p_e in pause_list:
+                    new_segments = []
+                    for s_s, s_e in segments:
+                        # Hvis pause er uden for segmentet, bevar segmentet
+                        if p_e <= s_s or p_s >= s_e:
+                            new_segments.append((s_s, s_e))
+                        else:
+                            # Del segmentet op og fjern pause-delen
+                            if p_s > s_s:
+                                new_segments.append((s_s, p_s))
+                            if p_e < s_e:
+                                new_segments.append((p_e, s_e))
+                    segments = new_segments
+                return [s for s in segments if (s[1] - s[0]).total_seconds() > 60]
+
             gap_report = []
             max_b = int(result['bord_nr'].max())
             last_time_overall = datetime.strptime(result['Sluttid'].max(), "%H:%M")
@@ -226,36 +244,38 @@ if uploaded_file:
             for b in range(1, max_b + 1):
                 b_sessions = result[result['bord_nr'] == b].sort_values('s_dt')
                 if b_sessions.empty:
-                    gap_report.append(f"Bord {b}: Helt ledigt hele dagen.")
+                    gap_report.append(f"Bord {b}: Helt ledigt.")
                     continue
                 
-                table_gaps = []
-                # Tjek gap før første session
-                first_s = b_sessions.iloc[0]['s_dt']
-                if first_s > g_start:
-                    table_gaps.append(f"{g_start.strftime('%H:%M')}-{first_s.strftime('%H:%M')}")
+                table_raw_gaps = []
+                # 1. Gap fra start til første session
+                if b_sessions.iloc[0]['s_dt'] > g_start:
+                    table_raw_gaps.append((g_start, b_sessions.iloc[0]['s_dt']))
                 
-                # Tjek gaps mellem sessioner
+                # 2. Gaps mellem sessioner
                 for i in range(len(b_sessions)-1):
                     curr_e = b_sessions.iloc[i]['e_dt']
                     next_s = b_sessions.iloc[i+1]['s_dt']
                     if next_s > curr_e:
-                        # Filtrer pauser fra hullerne hvis de overlapper præcis
-                        is_pure_pause = any(p_s <= curr_e and p_e >= next_s for p_s, p_e in pauser)
-                        if not is_pure_pause:
-                            table_gaps.append(f"{curr_e.strftime('%H:%M')}-{next_s.strftime('%H:%M')}")
+                        table_raw_gaps.append((curr_e, next_s))
                 
-                # Tjek gap efter sidste session (op til dagens slutning)
-                last_e = b_sessions.iloc[-1]['e_dt']
-                if last_e < last_time_overall:
-                    table_gaps.append(f"{last_e.strftime('%H:%M')}-{last_time_overall.strftime('%H:%M')}")
+                # 3. Gap fra sidste session til dagens slutning
+                if b_sessions.iloc[-1]['e_dt'] < last_time_overall:
+                    table_raw_gaps.append((b_sessions.iloc[-1]['e_dt'], last_time_overall))
                 
-                if table_gaps:
-                    gap_report.append(f"Bord {b}: Ledigt kl. " + ", ".join(table_gaps))
+                # Filtrer pauser ud fra alle fundne gaps
+                final_gaps_for_table = []
+                for gs, ge in table_raw_gaps:
+                    filtered = get_actual_gaps(gs, ge, pauser)
+                    for f_s, f_e in filtered:
+                        final_gaps_for_table.append(f"{f_s.strftime('%H:%M')}-{f_e.strftime('%H:%M')}")
+                
+                if final_gaps_for_table:
+                    gap_report.append(f"Bord {b}: Ledigt kl. " + ", ".join(final_gaps_for_table))
                 else:
-                    gap_report.append(f"Bord {b}: Fuldt booket.")
+                    gap_report.append(f"Bord {b}: Fuldt booket (fratrukket pauser).")
             
-            st.text_area("Oversigt over ledige tider pr. bord:", value="\\n".join(gap_report), height=300)
+            st.text_area("Oversigt over ledige tider pr. bord (pauser er ikke medregnet):", value="\\n".join(gap_report), height=300)
 
     except Exception as e:
         st.error(f"Der skete en fejl: {e}")
