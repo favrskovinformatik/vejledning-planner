@@ -27,7 +27,7 @@ import re
 
 st.set_page_config(page_title="Vejledningsplanlægger", layout="wide")
 
-# CSS: Sikrer pæn sidebar uden mærkelige linjeskift
+# CSS: Sikrer pæn sidebar
 st.markdown("""
 <style>
     [data-testid="stSidebar"] { min-width: 400px !important; }
@@ -44,23 +44,9 @@ st.info("Denne app kører 100% lokalt i din browser (GDPR-sikker).")
 # --- SIDEBAR: INDSTILLINGER ---
 st.sidebar.header("Indstillinger")
 
-start_tid_str = st.sidebar.text_input(
-    "Starttidspunkt (tt.mm)", 
-    value="08:15",
-    help="Indtast hvornår første vejledning starter (f.eks. 08:00)."
-)
-
-varighed = st.sidebar.number_input(
-    "Minutter pr. vejledning", 
-    value=15,
-    help="Standard er 15 minutter."
-)
-
-pause_input = st.sidebar.text_area(
-    "Pauser", 
-    value="09:50-10:10, 11:45-12:15, 13:50-14:00",
-    help="Format: start-slut. Adskil flere pauser med komma."
-)
+start_tid_str = st.sidebar.text_input("Starttidspunkt (tt.mm)", value="08:15")
+varighed = st.sidebar.number_input("Minutter pr. vejledning", value=15)
+pause_input = st.sidebar.text_area("Pauser", value="09:50-10:10, 11:45-12:15, 13:50-14:00")
 
 def parse_pauser(pause_str):
     pauser = []
@@ -82,19 +68,18 @@ def solve_final_logic(df, start_str, pauses):
         global_start = datetime.strptime(start_str, "%H:%M")
     except: return None
 
-    # 1. Belastning og rangering (Hvem er mest travl?)
+    # 1. Belastning og rangering
     t_counts = pd.concat([df['Lærer1'], df['Lærer2']]).astype(str).str.strip().value_counts().to_dict()
     all_teachers = sorted(t_counts.keys(), key=lambda x: (t_counts[x], x), reverse=True)
     teacher_rank = {teacher: i for i, teacher in enumerate(all_teachers)}
 
     # 2. Gruppering af makkerpar (Stimer)
-    # Vi grupperer sessioner der har de samme to lærere
     df['pair_key'] = df.apply(lambda r: tuple(sorted([str(r['Lærer1']).strip(), str(r['Lærer2']).strip()])), axis=1)
     pair_groups = df.groupby('pair_key')
     
-    # Sorter grupperne: Dem med flest sessioner sammen eller de mest travle lærere først
     sorted_groups = []
     for key, group in pair_groups:
+        # Vægtning: Flest sessioner sammen prioriteres højest
         weight = len(group) * 1000 + (1000 - teacher_rank.get(key[0], 999)) + (1000 - teacher_rank.get(key[1], 999))
         sorted_groups.append({'key': key, 'data': group, 'weight': weight})
     sorted_groups = sorted(sorted_groups, key=lambda x: x['weight'], reverse=True)
@@ -102,12 +87,10 @@ def solve_final_logic(df, start_str, pauses):
     teacher_busy_slots = {t: [] for t in all_teachers}
     planned_sessions = []
 
-    # 3. Planlæg tider (Prioritér uafbrudte blokke)
+    # 3. Planlæg tider (Uafbrudte blokke)
     for group in sorted_groups:
         pair = group['key']
         sessions_in_group = group['data'].to_dict('records')
-        
-        # Find første ledige tidspunkt hvor BEGGE lærere er ledige i HELE blokkens varighed
         total_needed_minutes = len(sessions_in_group) * varighed
         curr = global_start
         found_block = False
@@ -116,9 +99,7 @@ def solve_final_logic(df, start_str, pauses):
             block_start = curr
             block_end = curr + timedelta(minutes=total_needed_minutes)
             
-            # Tjek for pauser i hele blokken
-            # Hvis en pause rammer midt i en blok, skal blokken "knækkes" eller flyttes?
-            # Reglen er "uden afbrydelser", så vi flytter hele blokken til efter pausen.
+            # Tjek pauser
             overlap_pause = False
             for ps, pe in pauses:
                 if is_overlapping(block_start, block_end, ps, pe):
@@ -127,20 +108,19 @@ def solve_final_logic(df, start_str, pauses):
                     break
             if overlap_pause: continue
 
-            # Tjek om begge lærere er ledige i hele tidsrummet
+            # Tjek lærerkonflikter
             conflict = False
             for teacher in pair:
                 if any(is_overlapping(block_start, block_end, bs, be) for bs, be in teacher_busy_slots[teacher]):
-                    # Hvis optaget, flyt curr til slutningen af den konfliktende slot
                     conflict_slot = next(be for bs, be in teacher_busy_slots[teacher] if is_overlapping(block_start, block_end, bs, be))
-                    curr = max(curr + timedelta(minutes=varighed), conflict_slot)
+                    curr = max(curr + timedelta(minutes=1), conflict_slot)
                     conflict = True
                     break
             
             if not conflict:
                 found_block = True
         
-        # Book tiderne
+        # Book tider
         temp_start = block_start
         for s in sessions_in_group:
             temp_end = temp_start + timedelta(minutes=varighed)
@@ -150,7 +130,7 @@ def solve_final_logic(df, start_str, pauses):
                 teacher_busy_slots[teacher].sort()
             temp_start = temp_end
 
-    # 4. Tildel borde (Sticky Logic: Travleste lærer bliver siddende)
+    # 4. Tildel borde (Sticky Logic)
     sessions = sorted(planned_sessions, key=lambda x: x['s_dt'])
     teacher_last_table = {}
     table_occupied_until = {} 
@@ -160,25 +140,20 @@ def solve_final_logic(df, start_str, pauses):
         l1, l2 = str(s['Lærer1']).strip(), str(s['Lærer2']).strip()
         start, end = s['s_dt'], s['e_dt']
         
-        # Find den "vigtigste" (mest travle) lærer i denne session
         host = l1 if teacher_rank[l1] < teacher_rank[l2] else l2
         guest = l2 if host == l1 else l1
-        
         assigned_table = None
         
-        # Kan host blive siddende?
         if host in teacher_last_table:
             prev_table = teacher_last_table[host]
             if table_occupied_until.get(prev_table, global_start) <= start:
                 assigned_table = prev_table
         
-        # Hvis ikke, kan guest blive siddende?
         if assigned_table is None and guest in teacher_last_table:
             prev_table = teacher_last_table[guest]
             if table_occupied_until.get(prev_table, global_start) <= start:
                 assigned_table = prev_table
         
-        # Hvis ingen kan blive siddende, find det laveste ledige bord
         if assigned_table is None:
             t_nr = 1
             while True:
@@ -187,7 +162,6 @@ def solve_final_logic(df, start_str, pauses):
                     break
                 t_nr += 1
         
-        # Opdater registre
         table_occupied_until[assigned_table] = end
         teacher_last_table[l1] = assigned_table
         teacher_last_table[l2] = assigned_table
@@ -201,13 +175,14 @@ def solve_final_logic(df, start_str, pauses):
         final_results.append(s)
 
     res_df = pd.DataFrame(final_results)
-    return res_df.drop(columns=['pair_key', 'priority', 's_dt', 'e_dt']).sort_values(by=['Starttid', 'bord_nr'])
+    # FJERN kun de kolonner der faktisk er oprettet
+    cols_to_drop = [c for c in ['pair_key', 's_dt', 'e_dt'] if c in res_df.columns]
+    return res_df.drop(columns=cols_to_drop).sort_values(by=['Starttid', 'bord_nr'])
 
 # --- FORSIDE ---
 st.markdown("---")
 st.subheader("Instruktion")
-st.write("Vælg de relevante indstillinger til venstre og upload derefter et Excel-ark med følgende kolonner i første række:")
-st.code("K.id., Fornavn, Efternavn, Fag1, Lærer1, Fag2, Lærer2")
+st.write("Upload Excel-ark med kolonner: K.id., Fornavn, Efternavn, Fag1, Lærer1, Fag2, Lærer2")
 
 uploaded_file = st.file_uploader("Vælg Excel-fil", type=["xlsx"])
 
