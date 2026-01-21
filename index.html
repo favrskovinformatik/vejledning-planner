@@ -116,9 +116,10 @@ def solve_final_logic(df, start_str, pauses):
             teacher_busy_slots[l].sort()
         planned_sessions.append({**row.to_dict(), 's_dt': curr, 'e_dt': endt})
 
-    # 3. Tildel borde (Minimerer flyt for travle lærere)
+# 3. Tildel borde (Optimeret til max_concurrent og stabilitet)
     sessions = sorted(planned_sessions, key=lambda x: x['s_dt'])
     
+    # Beregn præcis hvor mange borde der er brug for (max_concurrent)
     time_points = []
     for s in sessions:
         time_points.append((s['s_dt'], 1))
@@ -130,9 +131,9 @@ def solve_final_logic(df, start_str, pauses):
         current += delta
         max_concurrent = max(max_concurrent, current)
 
-    # De mest travle lærere får faste borde
+    # De mest travle lærere får tildelt et "Hjem-bord" mellem 1 og max_concurrent
     permanent_teachers = all_teachers[:max_concurrent]
-    teacher_fixed_table = {t: i+1 for i, t in enumerate(permanent_teachers)}
+    teacher_home_table = {t: i+1 for i, t in enumerate(permanent_teachers)}
     
     table_occupied_until = {} 
     final_results = []
@@ -140,23 +141,36 @@ def solve_final_logic(df, start_str, pauses):
     for s in sessions:
         l1, l2 = str(s['Lærer1']).strip(), str(s['Lærer2']).strip()
         start, end = s['s_dt'], s['e_dt']
-        host = l1 if teacher_rank[l1] < teacher_rank[l2] else l2
-        guest = l2 if host == l1 else l1
+        
+        # Find ud af hvem der er mest "vigtig" i denne session (lavest rank = mest travl)
+        h_l = l1 if teacher_rank[l1] < teacher_rank[l2] else l2
+        g_l = l2 if h_l == l1 else l1
+        
         assigned_table = None
         
-        if host in teacher_fixed_table:
-            assigned_table = teacher_fixed_table[host]
-        elif guest in teacher_fixed_table:
-            assigned_table = teacher_fixed_table[guest]
+        # PRIORITET 1: Hvis den mest travle lærer har et hjem-bord, og det er ledigt
+        if h_l in teacher_home_table:
+            pref = teacher_home_table[h_l]
+            if table_occupied_until.get(pref, global_start) <= start:
+                assigned_table = pref
         
+        # PRIORITET 2: Hvis gæsten har et hjem-bord, og det er ledigt
+        if assigned_table is None and g_l in teacher_home_table:
+            pref = teacher_home_table[g_l]
+            if table_occupied_until.get(pref, global_start) <= start:
+                assigned_table = pref
+        
+        # PRIORITET 3: Hvis ingen har et ledigt hjem-bord, så tag det laveste ledige bord overhovedet
         if assigned_table is None:
-            t_nr = max_concurrent + 1
+            t_nr = 1
             while True:
                 if table_occupied_until.get(t_nr, global_start) <= start:
                     assigned_table = t_nr
-                    table_occupied_until[t_nr] = end
                     break
                 t_nr += 1
+        
+        # Opdater hvornår bordet er ledigt igen
+        table_occupied_until[assigned_table] = end
         
         s.update({
             'Starttid': start.strftime("%H:%M"),
