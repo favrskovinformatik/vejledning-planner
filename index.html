@@ -86,7 +86,7 @@ def solve_final_logic(df, start_str, pauses):
     teacher_busy_slots = {t: [] for t in all_teachers}
     planned_sessions = []
 
-    # 3. Planlæg tider (Uafbrudte blokke)
+    # 3. Tidsplanlægning
     for group in sorted_groups:
         pair = group['key']
         sessions_in_group = group['data'].to_dict('records')
@@ -102,8 +102,7 @@ def solve_final_logic(df, start_str, pauses):
             for ps, pe in pauses:
                 if is_overlapping(block_start, block_end, ps, pe):
                     curr = pe
-                    overlap_pause = True
-                    break
+                    overlap_pause = True; break
             if overlap_pause: continue
 
             conflict = False
@@ -111,11 +110,9 @@ def solve_final_logic(df, start_str, pauses):
                 if any(is_overlapping(block_start, block_end, bs, be) for bs, be in teacher_busy_slots[teacher]):
                     conflict_slot = next(be for bs, be in teacher_busy_slots[teacher] if is_overlapping(block_start, block_end, bs, be))
                     curr = max(curr + timedelta(minutes=1), conflict_slot)
-                    conflict = True
-                    break
+                    conflict = True; break
             
-            if not conflict:
-                found_block = True
+            if not conflict: found_block = True
         
         temp_start = block_start
         for s in sessions_in_group:
@@ -126,10 +123,22 @@ def solve_final_logic(df, start_str, pauses):
                 teacher_busy_slots[teacher].sort()
             temp_start = temp_end
 
-    # 4. Tildel borde (Sticky Logic)
+    # 4. Bordplanlægning (Hjem-borde)
     sessions = sorted(planned_sessions, key=lambda x: x['s_dt'])
-    teacher_last_table = {}
-    table_occupied_until = {} 
+    time_points = []
+    for s in sessions:
+        time_points.append((s['s_dt'], 1))
+        time_points.append((s['e_dt'], -1))
+    time_points.sort()
+    max_concurrent = 0
+    current_count = 0
+    for _, delta in time_points:
+        current_count += delta
+        max_concurrent = max(max_concurrent, current_count)
+
+    teacher_home_table = {all_teachers[i]: i+1 for i in range(min(len(all_teachers), max_concurrent))}
+    
+    table_occupied_until = {}
     final_results = []
     
     for s in sessions:
@@ -138,17 +147,18 @@ def solve_final_logic(df, start_str, pauses):
         
         host = l1 if teacher_rank[l1] < teacher_rank[l2] else l2
         guest = l2 if host == l1 else l1
+        
         assigned_table = None
         
-        if host in teacher_last_table:
-            prev_table = teacher_last_table[host]
-            if table_occupied_until.get(prev_table, global_start) <= start:
-                assigned_table = prev_table
+        if host in teacher_home_table:
+            target = teacher_home_table[host]
+            if table_occupied_until.get(target, global_start) <= start:
+                assigned_table = target
         
-        if assigned_table is None and guest in teacher_last_table:
-            prev_table = teacher_last_table[guest]
-            if table_occupied_until.get(prev_table, global_start) <= start:
-                assigned_table = prev_table
+        if assigned_table is None and guest in teacher_home_table:
+            target = teacher_home_table[guest]
+            if table_occupied_until.get(target, global_start) <= start:
+                assigned_table = target
         
         if assigned_table is None:
             t_nr = 1
@@ -159,16 +169,7 @@ def solve_final_logic(df, start_str, pauses):
                 t_nr += 1
         
         table_occupied_until[assigned_table] = end
-        teacher_last_table[l1] = assigned_table
-        teacher_last_table[l2] = assigned_table
-        
-        s.update({
-            'Starttid': start.strftime("%H:%M"),
-            'Sluttid': end.strftime("%H:%M"),
-            'Bord': f"Bord {assigned_table}",
-            'bord_nr': assigned_table
-        })
-        final_results.append(s)
+        final_results.append({**s, 'Bord': f"Bord {assigned_table}", 'bord_nr': assigned_table})
 
     res_df = pd.DataFrame(final_results)
     cols_to_drop = [c for c in ['pair_key', 's_dt', 'e_dt'] if c in res_df.columns]
@@ -190,20 +191,7 @@ if uploaded_file:
         if result is not None:
             st.success(f"✅ Planlægning færdig! Sidste vejledning slutter kl. {result['Sluttid'].max()}")
             
-            # --- RANGERING AF LÆRERE ---
-            st.subheader("📊 Læreroversigt (Travlhed & Stabilitet)")
-            teachers = sorted(list(set(result['Lærer1'].astype(str)) | set(result['Lærer2'].astype(str))))
-            ranking_data = []
-            for t in teachers:
-                t_sessions = result[(result['Lærer1'] == t) | (result['Lærer2'] == t)].sort_values('Starttid')
-                count = len(t_sessions)
-                borde = t_sessions['Bord'].unique()
-                skifter = "🔴 Ja" if len(borde) > 1 else "🟢 Nej"
-                ranking_data.append({"Lærer": t, "Antal vejledninger": count, "Skal skifte bord": skifter})
-            
-            ranking_df = pd.DataFrame(ranking_data).sort_values("Antal vejledninger", ascending=False)
-            st.dataframe(ranking_df, use_container_width=True, hide_index=True)
-
+            # Hjælpefunktion til Excel-generering
             def get_excel(data, mode):
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -222,11 +210,34 @@ if uploaded_file:
                             data[data['bord_nr']==b].to_excel(writer, sheet_name=f"Bord {b}", index=False)
                 return output.getvalue()
 
-            st.markdown("### Download resultater")
+            # --- DOWNLOAD KNAPPER (Flyttet op) ---
+            st.markdown("### 📥 Download resultater")
             c1, c2, c3 = st.columns(3)
             c1.download_button("📂 Hent Lærer-planer", get_excel(result, 'laerer'), "laerer_planer.xlsx")
             c2.download_button("🎓 Hent Elev-planer", get_excel(result, 'elev'), "elev_planer.xlsx")
             c3.download_button("🖼️ Hent Bord-planer", get_excel(result, 'bord'), "bord_planer.xlsx")
+
+            st.markdown("---")
+
+            # --- RANGERING AF LÆRERE (Flyttet ned) ---
+            st.subheader("📊 Læreroversigt (Travlhed & Stabilitet)")
+            teachers_in_plan = sorted(list(set(result['Lærer1'].astype(str)) | set(result['Lærer2'].astype(str))))
+            ranking_data = []
+            for t in teachers_in_plan:
+                t_sessions = result[(result['Lærer1'] == t) | (result['Lærer2'] == t)].sort_values('Starttid')
+                count = len(t_sessions)
+                borde = t_sessions['Bord'].unique()
+                skifter = "🔴 Ja" if len(borde) > 1 else "🟢 Nej"
+                ranking_data.append({
+                    "Lærer": t, 
+                    "Antal vejledninger": count, 
+                    "Antal borde brugt": len(borde), 
+                    "Skal skifte bord": skifter
+                })
+            
+            ranking_df = pd.DataFrame(ranking_data).sort_values("Antal vejledninger", ascending=False)
+            st.dataframe(ranking_df, use_container_width=True, hide_index=True)
+
     except Exception as e:
         st.error(f"Der skete en fejl: {e}")
 `
