@@ -87,7 +87,7 @@ def solve_final_logic(df, start_str, pauses):
     all_teachers = sorted(t_counts.keys(), key=lambda x: (t_counts[x], x), reverse=True)
     teacher_rank = {teacher: i for i, teacher in enumerate(all_teachers)}
 
-    # 2. Planlæg tider (Maksimal kompakthed)
+    # 2. Planlæg tider (Kompakthed)
     df['priority'] = df.apply(lambda r: t_counts.get(str(r['Lærer1']).strip(), 0) + t_counts.get(str(r['Lærer2']).strip(), 0), axis=1)
     df_sorted = df.sort_values(by='priority', ascending=False)
     
@@ -116,10 +116,10 @@ def solve_final_logic(df, start_str, pauses):
             teacher_busy_slots[l].sort()
         planned_sessions.append({**row.to_dict(), 's_dt': curr, 'e_dt': endt})
 
-# 3. Tildel borde (Med Look-ahead stabilitet)
+    # 3. Tildel borde (Sikret mod dobbeltbooking og unødvendige flyt)
     sessions = sorted(planned_sessions, key=lambda x: x['s_dt'])
     
-    # Find max concurrent for at definere "Hjem-borde"
+    # Beregn max concurrent til hjem-borde
     time_points = []
     for s in sessions:
         time_points.append((s['s_dt'], 1))
@@ -131,85 +131,84 @@ def solve_final_logic(df, start_str, pauses):
         current += delta
         max_concurrent = max(max_concurrent, current)
 
-    # Definer hjem-borde og hvornår ejerne skal bruge dem
     teacher_home_table = {t: i+1 for i, t in enumerate(all_teachers[:max_concurrent])}
     home_table_owner_needs = {i+1: [] for i in range(max_concurrent)}
     for s in sessions:
-        l1, l2 = str(s['Lærer1']).strip(), str(s['Lærer2']).strip()
-        for l in [l1, l2]:
+        for l in [str(s['Lærer1']).strip(), str(s['Lærer2']).strip()]:
             if l in teacher_home_table:
                 home_table_owner_needs[teacher_home_table[l]].append((s['s_dt'], s['e_dt']))
 
     table_occupied_until = {} 
-    teacher_current_session_table = {} # Husker bordet for igangværende stime
+    teacher_active_streak_table = {} 
     final_results = []
     
-    # Vi behandler sessionerne i rækkefølge
     for i, s in enumerate(sessions):
         l1, l2 = str(s['Lærer1']).strip(), str(s['Lærer2']).strip()
         start, end = s['s_dt'], s['e_dt']
         pair_key = tuple(sorted([l1, l2]))
         
-        # 1. FIND STIMEN: Hvor længe skal dette par sidde sammen i træk?
-        streak_end = end
-        for next_s in sessions[i+1:]:
-            next_l1, next_l2 = str(next_s['Lærer1']).strip(), str(next_s['Lærer2']).strip()
-            if tuple(sorted([next_l1, next_l2])) == pair_key and next_s['s_dt'] == streak_end:
-                streak_end = next_s['e_dt']
-            elif next_s['s_dt'] > streak_end: # Vi er nået forbi deres tidsblok
-                break
-        
         assigned_table = None
 
-        # A. Hvis de allerede er i en stime, så bliv ved det bord der blev valgt før
-        if pair_key in teacher_current_session_table:
-            assigned_table = teacher_current_session_table[pair_key]
-        else:
-            # B. De starter en ny stime. Find et bord der er ledigt i HELE tidsrummet [start, streak_end]
+        # Tjek om de er i en igangværende stime (sidder allerede ved et bord)
+        if pair_key in teacher_active_streak_table:
+            potential_table = teacher_active_streak_table[pair_key]
+            # Sikkerhedstjek: Er bordet faktisk ledigt? (Bør det være i en stime)
+            if table_occupied_until.get(potential_table, global_start) <= start:
+                assigned_table = potential_table
+
+        if assigned_table is None:
+            # Beregn hvor længe de skal sidde sammen (Stime)
+            streak_end = end
+            for next_s in sessions[i+1:]:
+                if tuple(sorted([str(next_s['Lærer1']).strip(), str(next_s['Lærer2']).strip()])) == pair_key and next_s['s_dt'] == streak_end:
+                    streak_end = next_s['e_dt']
+                elif next_s['s_dt'] > streak_end: break
+
+            # Find det bedste ledige bord til hele stimen
             t_nr = 1
             while assigned_table is None:
-                # Er bordet ledigt lige nu?
+                # 1. Er bordet ledigt NU?
                 if table_occupied_until.get(t_nr, global_start) <= start:
-                    
-                    # Er dette et hjem-bord for en anden lærer?
+                    # 2. Er det et hjem-bord for en anden?
+                    conflict = False
                     if t_nr in home_table_owner_needs:
-                        # Tjek om ejeren skal bruge bordet på noget tidspunkt under vores stime
-                        conflict = False
-                        for owner_start, owner_end in home_table_owner_needs[t_nr]:
-                            if is_overlapping(start, streak_end, owner_start, owner_end):
-                                # Men hov, er det os selv der er ejeren?
+                        for o_s, o_e in home_table_owner_needs[t_nr]:
+                            if is_overlapping(start, streak_end, o_s, o_e):
+                                # Hvis det ikke er dem selv der ejer det, er det en konflikt
                                 if not (l1 in teacher_home_table and teacher_home_table[l1] == t_nr) and \
                                    not (l2 in teacher_home_table and teacher_home_table[l2] == t_nr):
-                                    conflict = True
-                                    break
-                        if not conflict:
-                            assigned_table = t_nr
-                    else:
-                        # Bordet er ikke et hjem-bord for nogen, så vi tager det
+                                    conflict = True; break
+                    
+                    if not conflict:
                         assigned_table = t_nr
-                
                 t_nr += 1
-                if t_nr > 100: break # Sikkerhedsafbryder
 
-        # Opdater registre
+        # Registrer bookingen
         table_occupied_until[assigned_table] = end
-        if end < streak_end:
-            teacher_current_session_table[pair_key] = assigned_table
-        else:
-            # Stimen er slut
-            if pair_key in teacher_current_session_table:
-                del teacher_current_session_table[pair_key]
+        
+        # Opdater stime-hukommelse: Skal de blive her i næste runde?
+        # Vi kigger fremad igen for at se om de har en session præcis efter denne
+        has_next = False
+        for next_s in sessions[i+1:]:
+            if tuple(sorted([str(next_s['Lærer1']).strip(), str(next_s['Lærer2']).strip()])) == pair_key and next_s['s_dt'] == end:
+                has_next = True; break
+        
+        if has_next:
+            teacher_active_streak_table[pair_key] = assigned_table
+        elif pair_key in teacher_active_streak_table:
+            del teacher_active_streak_table[pair_key]
         
         s.update({
             'Starttid': start.strftime("%H:%M"),
             'Sluttid': end.strftime("%H:%M"),
             'Bord': f"Bord {assigned_table}",
-            'bord_nr': assigned_table
+            'bord_nr': assigned_table # Midlertidig til sortering
         })
         final_results.append(s)
 
     res_df = pd.DataFrame(final_results)
-    return res_df.drop(columns=['priority', 's_dt', 'e_dt']).sort_values(by=['Starttid', 'bord_nr'])
+    # FJERN bord_nr INDEN RETURNERING
+    return res_df.drop(columns=['priority', 's_dt', 'e_dt', 'bord_nr']).sort_values(by=['Starttid', 'Bord'])
 
 # --- FORSIDE ---
 st.markdown("---")
