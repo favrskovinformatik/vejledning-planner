@@ -73,7 +73,7 @@ def solve_final_logic(df, start_str, pauses):
     all_teachers = sorted(t_counts.keys(), key=lambda x: (t_counts[x], x), reverse=True)
     teacher_rank = {teacher: i for i, teacher in enumerate(all_teachers)}
 
-    # 2. Gruppering af makkerpar (Stimer)
+    # 2. Gruppering af makkerpar (Stimer) - PRIORITET 1: UAFBRUDTE FORLØB
     df['pair_key'] = df.apply(lambda r: tuple(sorted([str(r['Lærer1']).strip(), str(r['Lærer2']).strip()])), axis=1)
     pair_groups = df.groupby('pair_key')
     
@@ -84,9 +84,9 @@ def solve_final_logic(df, start_str, pauses):
     sorted_groups = sorted(sorted_groups, key=lambda x: x['weight'], reverse=True)
 
     teacher_busy_slots = {t: [] for t in all_teachers}
-    planned_sessions = []
+    planned_times = []
 
-    # 3. Tidsplanlægning
+    # Planlæg tider (Hvorfor og hvornår)
     for group in sorted_groups:
         pair = group['key']
         sessions_in_group = group['data'].to_dict('records')
@@ -117,66 +117,91 @@ def solve_final_logic(df, start_str, pauses):
         temp_start = block_start
         for s in sessions_in_group:
             temp_end = temp_start + timedelta(minutes=varighed)
-            planned_sessions.append({**s, 's_dt': temp_start, 'e_dt': temp_end})
+            planned_times.append({**s, 's_dt': temp_start, 'e_dt': temp_end})
             for teacher in pair:
                 teacher_busy_slots[teacher].append((temp_start, temp_end))
                 teacher_busy_slots[teacher].sort()
             temp_start = temp_end
 
-    # 4. Bordplanlægning (Hjem-borde)
-    sessions = sorted(planned_sessions, key=lambda x: x['s_dt'])
+    # 3. Bordplanlægning (To-Pass Logik for at sikre de travleste)
+    # Find max concurrent for at definere hjem-borde
     time_points = []
-    for s in sessions:
+    for s in planned_times:
         time_points.append((s['s_dt'], 1))
         time_points.append((s['e_dt'], -1))
     time_points.sort()
     max_concurrent = 0
-    current_count = 0
+    c_count = 0
     for _, delta in time_points:
-        current_count += delta
-        max_concurrent = max(max_concurrent, current_count)
+        c_count += delta
+        max_concurrent = max(max_concurrent, c_count)
 
+    # De N mest travle lærere ejer et bord 1..N
     teacher_home_table = {all_teachers[i]: i+1 for i in range(min(len(all_teachers), max_concurrent))}
     
-    table_occupied_until = {}
-    final_results = []
-    
-    for s in sessions:
+    table_occupied_until = {} 
+    final_sessions = []
+
+    # PASS 1: Tildel borde til alle sessioner hvor mindst én lærer har et HJEM-BORD
+    home_sessions = []
+    floater_sessions = []
+    for s in planned_times:
+        l1, l2 = str(s['Lærer1']).strip(), str(s['Lærer2']).strip()
+        if l1 in teacher_home_table or l2 in teacher_home_table:
+            home_sessions.append(s)
+        else:
+            floater_sessions.append(s)
+
+    # Vi sorterer home_sessions efter tid, men behandler dem før floaterne
+    home_sessions.sort(key=lambda x: x['s_dt'])
+
+    for s in home_sessions:
         l1, l2 = str(s['Lærer1']).strip(), str(s['Lærer2']).strip()
         start, end = s['s_dt'], s['e_dt']
         
-        host = l1 if teacher_rank[l1] < teacher_rank[l2] else l2
-        guest = l2 if host == l1 else l1
+        # Vælg det bedste hjem-bord blandt deltagerne
+        h1 = teacher_home_table.get(l1)
+        h2 = teacher_home_table.get(l2)
         
+        if h1 and h2:
+            assigned_table = h1 if teacher_rank[l1] < teacher_rank[l2] else h2
+        else:
+            assigned_table = h1 if h1 else h2
+            
+        table_occupied_until[(assigned_table, start)] = end # Marker som optaget i denne blok
+        s['bord_nr'] = assigned_table
+        final_sessions.append(s)
+
+    # PASS 2: Tildel de resterende (floaters) til ledige huller
+    floater_sessions.sort(key=lambda x: x['s_dt'])
+    for s in floater_sessions:
+        start, end = s['s_dt'], s['e_dt']
         assigned_table = None
-        
-        if host in teacher_home_table:
-            target = teacher_home_table[host]
-            if table_occupied_until.get(target, global_start) <= start:
-                assigned_table = target
-        
-        if assigned_table is None and guest in teacher_home_table:
-            target = teacher_home_table[guest]
-            if table_occupied_until.get(target, global_start) <= start:
-                assigned_table = target
-        
-        if assigned_table is None:
-            t_nr = 1
-            while True:
-                if table_occupied_until.get(t_nr, global_start) <= start:
-                    assigned_table = t_nr
-                    break
+        t_nr = 1
+        while assigned_table is None:
+            # Tjek om bordet er ledigt i denne specifikke tidsblok
+            is_free = True
+            for (occupied_table, occ_start), occ_end in table_occupied_until.items():
+                if occupied_table == t_nr and is_overlapping(start, end, occ_start, occ_end):
+                    is_free = False; break
+            
+            if is_free:
+                assigned_table = t_nr
+            else:
                 t_nr += 1
         
-        table_occupied_until[assigned_table] = end
-        
-        # Opret det endelige resultat med alle tids-strenge
-        res_entry = {**s}
-        res_entry['Starttid'] = start.strftime("%H:%M")
-        res_entry['Sluttid'] = end.strftime("%H:%M")
-        res_entry['Bord'] = f"Bord {assigned_table}"
-        res_entry['bord_nr'] = assigned_table
-        final_results.append(res_entry)
+        table_occupied_until[(assigned_table, start)] = end
+        s['bord_nr'] = assigned_table
+        final_sessions.append(s)
+
+    # Formater resultater
+    final_results = []
+    for s in final_sessions:
+        res = {**s}
+        res['Starttid'] = s['s_dt'].strftime("%H:%M")
+        res['Sluttid'] = s['e_dt'].strftime("%H:%M")
+        res['Bord'] = f"Bord {s['bord_nr']}"
+        final_results.append(res)
 
     res_df = pd.DataFrame(final_results)
     cols_to_drop = [c for c in ['pair_key', 's_dt', 'e_dt'] if c in res_df.columns]
